@@ -1,0 +1,49 @@
+name: CI
+
+# Test + lint gate on every push to main and every PR. Complements release.yml
+# (which only builds + publishes the native libs on a tag). Runs the unit tests
+# (src/lib.rs) and the C-ABI integration tests (tests/c_abi.rs) on all three
+# desktop OSes, plus a no-default-features pass that proves the iOS no-JIT
+# (Pulley-only, no Cranelift) build links and its ungated tests pass.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test · ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # Default features (compile): unit + integration tests, incl. Cranelift,
+      # Component Model, async, and the precompile → run-precompiled path.
+      - name: Unit + integration tests (default features)
+        run: cargo test --all-targets --locked
+
+      # iOS no-JIT path: build runtime + Pulley only (no Cranelift / wat). Scoped
+      # to --lib --tests because the examples are desktop tooling that needs the
+      # compiler (Module::new / precompile). The compile-gated tests compile out;
+      # the rest must still pass, proving the shipped iOS library links + its ABI.
+      - name: No-JIT build + tests (--no-default-features)
+        run: cargo test --no-default-features --lib --tests --locked
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
