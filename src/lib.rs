@@ -13,21 +13,24 @@
 //! `…/docs/52_wasi-0.3-spike-plan.md` (the P0 spike this crate is the harness
 //! for).
 //!
-//! ## Status: SPIKE-STAGE
-//! Only the ABI surface and a runtime self-test are wired. The component
-//! instantiation, the WASI worlds (`wasi:http` etc.), and the async-over-FFI
-//! bridge are the P0 spike's deliverables and are **not implemented yet** — do
-//! not depend on this crate's shape until the spike gates (Pulley-on-iOS,
-//! C-ABI-vs-generic-API, async-FFI) pass.
+//! ## Status (2026-06-16): spike gates PASSED; P1 done; P2 underway
+//! The P0 spike gates all passed (doc 52): Pulley-on-iOS (functional + 1.1 MB +
+//! verified running in the iOS Simulator), the bespoke C ABI, and async-over-FFI.
+//! Wired and tested (24 tests, Cranelift + Pulley):
+//! - `hwr_abi_version` / `hwr_self_test` — handshake + runtime self-test.
+//! - `hwr_engine_new`/`_free`, `hwr_instance_new`(compile) / `_new_precompiled`
+//!   (the no-JIT iOS deserialize path) / `_call_add` / `_free` — engine + instance
+//!   lifecycle (P1).
+//! - `hwr_precompile_component` / `hwr_free_bytes` — off-device AOT (P1).
+//! - `hwr_run_async_double` / `_component_async_double` / `_canonical_async_double`
+//!   — async host imports + the canonical async ABI (`task.return`), on
+//!   Wasmtime 45 (no 46 needed; see hellohq doc 53 §6.1).
+//! - `hwr_read_portfolio_count` — first **gated `workspace` host import** against
+//!   the doc-53 WIT world (`wit/world.wit`), the gate as chokepoint (P2 Option A).
 //!
-//! ## Planned C ABI (filled in across the spike → P1/P2)
-//! - `hwr_abi_version() -> u32`                                  — ABI version (now)
-//! - `hwr_self_test() -> i32`                                    — runtime links + inits (now)
-//! - `hwr_engine_new(config) -> *Engine` / `hwr_engine_free`     — engine lifecycle (P1)
-//! - `hwr_instantiate(engine, component_bytes, len) -> *Instance`— component load (P2)
-//! - `hwr_call(instance, …) -> status`                          — invoke export (P2)
-//! - async bridge: `hwr_step(instance) -> {done|pending(call_id)}`
-//!   + `hwr_resolve(call_id, bytes, len)`                        — host-call round-trip (P3)
+//! Still ahead: typed `list`/`string` marshaling via wit-bindgen/cargo-component;
+//! the `wasi:http` host impl (H4/H5); the Dart-serviced gate round-trip (P3);
+//! on-device A-series latency (hardware).
 //!
 //! Safety: every `extern "C"` entrypoint must `catch_unwind` and never let a
 //! panic cross the FFI boundary (see `Cargo.toml` `panic = unwind`).
@@ -96,7 +99,6 @@ fn run_component_add(use_pulley: bool, a: i32, b: i32) -> wasmtime::Result<i32> 
     let instance = linker.instantiate(&mut store, &component)?;
     let add = instance.get_typed_func::<(i32, i32), (i32,)>(&mut store, "add")?;
     let (result,) = add.call(&mut store, (a, b))?;
-    add.post_return(&mut store)?;
     Ok(result)
 }
 
@@ -140,7 +142,58 @@ fn run_component_host_import(use_pulley: bool, x: u32) -> wasmtime::Result<u32> 
     let instance = linker.instantiate(&mut store, &component)?;
     let run = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "run")?;
     let (r,) = run.call(&mut store, (x,))?;
-    run.post_return(&mut store)?;
+    Ok(r)
+}
+
+/// P2 Option A — a **gated `workspace.read-portfolio-names` host import** wired
+/// against the doc-53 world (`hellohq:plugin/workspace`). The component imports
+/// the read; the host implements it; the guest `run` calls it and returns the
+/// result. Sentinel for a gate denial.
+#[cfg(feature = "compile")]
+const WORKSPACE_READ_DENIED: u32 = u32::MAX;
+
+#[cfg(feature = "compile")]
+const WORKSPACE_READ_COMPONENT_WAT: &str = r#"(component
+  (import "read-portfolio-names" (func $read (result u32)))
+  (core func $read_core (canon lower (func $read)))
+  (core module $m
+    (import "host" "read" (func $r (result i32)))
+    (func (export "run") (result i32)
+      call $r))
+  (core instance $i (instantiate $m
+    (with "host" (instance (export "read" (func $read_core))))))
+  (func (export "run") (result u32)
+    (canon lift (core func $i "run"))))"#;
+
+/// Instantiates [WORKSPACE_READ_COMPONENT_WAT] and provides `read-portfolio-names`
+/// from the host. The host closure is the **permission-gate chokepoint** (in
+/// production this is serviced app-side via the Dart-supplied resolver — P3):
+/// `granted` → return the workspace data (here the portfolio *count*, a flat
+/// proxy for the full `list<portfolio-name>`, which uses this same Linker
+/// mechanism with wit-bindgen-generated list/string marshaling); denied →
+/// [WORKSPACE_READ_DENIED]. Proves a real hellohq read capability flows through
+/// the component world and the gate, on both backends.
+#[cfg(feature = "compile")]
+fn run_gated_workspace_read(
+    use_pulley: bool,
+    granted: bool,
+    count: u32,
+) -> wasmtime::Result<u32> {
+    use wasmtime::component::{Component, Linker};
+    let engine = make_engine(use_pulley)?;
+    let component = Component::new(&engine, WORKSPACE_READ_COMPONENT_WAT)?;
+    let mut linker = Linker::new(&engine);
+    linker.root().func_wrap(
+        "read-portfolio-names",
+        move |_store: wasmtime::StoreContextMut<'_, ()>, _: ()| -> wasmtime::Result<(u32,)> {
+            // The gate. Ungranted reads never reach workspace data.
+            Ok((if granted { count } else { WORKSPACE_READ_DENIED },))
+        },
+    )?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &component)?;
+    let run = instance.get_typed_func::<(), (u32,)>(&mut store, "run")?;
+    let (r,) = run.call(&mut store, ())?;
     Ok(r)
 }
 
@@ -159,7 +212,6 @@ const ASYNC_WAT: &str = r#"(module
 #[cfg(feature = "compile")]
 async fn run_async_double(use_pulley: bool, x: i32) -> wasmtime::Result<i32> {
     let mut cfg = Config::new();
-    cfg.async_support(true);
     if use_pulley {
         cfg.target("pulley64")?;
     }
@@ -404,6 +456,26 @@ pub extern "C" fn hwr_run_canonical_async_double(use_pulley: i32, x: i32) -> i64
     .unwrap_or(i64::MIN)
 }
 
+/// P2 Option A across the C ABI: runs the gated `workspace.read-portfolio-names`
+/// component. `granted != 0` returns `count` (as if the workspace held that many
+/// portfolios); denied returns `WORKSPACE_READ_DENIED` (u32::MAX as i64). Returns
+/// `i64::MIN` only on an internal error. The gate decision is the caller's
+/// (app-side in production).
+///
+/// # Safety
+/// None — takes no pointers.
+#[cfg(feature = "compile")]
+#[no_mangle]
+pub extern "C" fn hwr_read_portfolio_count(use_pulley: i32, granted: i32, count: u32) -> i64 {
+    std::panic::catch_unwind(|| {
+        match run_gated_workspace_read(use_pulley != 0, granted != 0, count) {
+            Ok(v) => v as i64,
+            Err(_) => i64::MIN,
+        }
+    })
+    .unwrap_or(i64::MIN)
+}
+
 // ── P1: handle-based engine + instance lifecycle ───────────────────────────
 //
 // The reusable runtime backbone, replacing the one-shot `hwr_eval_*` demo calls:
@@ -520,7 +592,6 @@ pub unsafe extern "C" fn hwr_instance_call_add(
             .get_typed_func::<(i32, i32), (i32,)>(&mut h.store, "add")
             .ok()?;
         let (r,) = add.call(&mut h.store, (a, b)).ok()?;
-        add.post_return(&mut h.store).ok()?;
         Some(r as i64)
     }))
     .ok()
@@ -738,6 +809,31 @@ mod tests {
             pollster::block_on(run_canonical_async_double(true, 21)).unwrap(),
             42
         );
+    }
+
+    #[cfg(feature = "compile")]
+    #[test]
+    fn workspace_read_granted() {
+        // Gate grants → the read host import returns workspace data, both backends.
+        assert_eq!(run_gated_workspace_read(false, true, 3).unwrap(), 3);
+        assert_eq!(run_gated_workspace_read(true, true, 3).unwrap(), 3);
+    }
+
+    #[cfg(feature = "compile")]
+    #[test]
+    fn workspace_read_denied() {
+        // Gate denies → the plugin never receives workspace data.
+        assert_eq!(
+            run_gated_workspace_read(false, false, 3).unwrap(),
+            WORKSPACE_READ_DENIED
+        );
+    }
+
+    #[cfg(feature = "compile")]
+    #[test]
+    fn workspace_read_c_abi() {
+        assert_eq!(hwr_read_portfolio_count(1, 1, 5), 5);
+        assert_eq!(hwr_read_portfolio_count(1, 0, 5), WORKSPACE_READ_DENIED as i64);
     }
 
     #[cfg(feature = "compile")]

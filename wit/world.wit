@@ -1,30 +1,153 @@
-// DRAFT — the HelloHQ Tier-2 plugin component world.
+// The HelloHQ Tier-2 plugin component world. Canonical artifact for the P2
+// migration designed in hellohq/docs/53_wasi-0.3-wit-world-design.md.
 //
-// Interface shapes are settled during the P0 spike (doc 52) and P2 against the
-// real WASI 0.3 packages; this file documents intent, it is not yet wired to
-// wit-bindgen / cargo-component.
+// This file is the hellohq-CUSTOM half of the world — host capabilities the
+// runtime implements + gates app-side. The STANDARD WASI half (wasi:http for
+// outbound, wasi:io for its body streams, wasi:clocks) is documented in the
+// `plugin` world below but kept commented until those packages are vendored
+// alongside the chosen Wasmtime, so this package validates standalone
+// (`wasm-tools component wit wit/`). `wasi:sockets` / `wasi:filesystem` are
+// deliberately NEVER imported — capability denial is structural (an unsatisfied
+// import fails instantiation).
 //
-// Design notes:
-//   - Outbound HTTP is the STANDARD `wasi:http` interface (async), so plugins
-//     are portable/language-agnostic. The host implements + GATES it app-side
-//     (origin allowlist + SSRF/private-IP blocking). `wasi:sockets` is NOT
-//     included — raw sockets are too broad an attack surface for plugins.
-//   - hellohq-specific capabilities (workspace reads, storage, events, and the
-//     async `ai:inference` that motivates this runtime) are custom interfaces
-//     alongside WASI, also gated app-side.
+// Status: the gate stays app-side (the runtime calls back to a host-supplied,
+// permission-checked resolver — P3). `read-portfolio-names` is the first
+// host import wired end-to-end against this world (P2 Option A); the rest follow
+// the same Linker pattern.
 
 package hellohq:plugin@0.1.0;
 
+// ── Shared types ────────────────────────────────────────────────────────────
+interface types {
+  // Gate denial, validation failure, or downstream error. Carries no secret,
+  // raw prompt/response, credential id, or request id (CLAUDE.md
+  // ai-harness-boundaries). `code` is a stable machine token; `message` is safe
+  // to surface to the plugin.
+  record api-error {
+    code: string,      // "permission-denied" | "origin-blocked" |
+                       // "address-blocked" | "rate-limited" | "not-found"
+    message: string,
+  }
+
+  record portfolio-name { id: string, name: string }
+
+  record currency-rate {
+    id: string,        // ISO 4217, e.g. "USD"
+    name: string,
+    symbol: string,
+    rate: f64,         // units per 1 unit of workspace base currency
+  }
+
+  record sheet-info { name: string, sections: list<string> }
+  record sheet-summary { portfolio-id: string, sheets: list<sheet-info> }
+
+  record category-count { category: string, count: u32 }
+  record asset-count { portfolio-id: string, count-by-category: list<category-count> }
+
+  record category-total { category: string, total: f64 }
+  record aggregated-summary { portfolio-id: string, totals: list<category-total> }
+}
+
+// ── Workspace reads (replaces the hq_read JSON-multiplexed byte protocol) ─────
+// Sync: read-only PDAO snapshot lives in the worker isolate. Each function is
+// independently permission-gated; aggregated requires Verified + per-portfolio
+// scope. In the legacy ABI these were one `hq_read` import dispatched by a
+// `{"method":…}` tag (doc 53 §1.1) — here split into named functions.
+interface workspace {
+  use types.{
+    api-error, portfolio-name, sheet-summary, asset-count,
+    currency-rate, aggregated-summary,
+  };
+
+  read-portfolio-names: func() -> result<list<portfolio-name>, api-error>;
+  read-sheet-structure: func(portfolio-id: string) -> result<sheet-summary, api-error>;
+  read-asset-count: func(portfolio-id: string) -> result<asset-count, api-error>;
+  read-currency-rates: func() -> result<list<currency-rate>, api-error>;
+  read-aggregated-values: func(portfolio-id: string) -> result<aggregated-summary, api-error>;
+
+  // write:external_output — RESERVED, not in the initial implementable surface:
+  // no Tier-2 wiring exists today (doc 53 §1.1). Shape reserved so adding it
+  // later is non-breaking.
+  write-external-file: func(filename: string, content: list<u8>) -> result<_, api-error>;
+}
+
+// ── Key-value storage (plugin:storage) ───────────────────────────────────────
+// Promoted from the sync worker-thread PluginStorageSync side-channel (doc 53
+// §1.1) into real imports. Host-keyed (plugin_id, key); per-plugin quota.
+interface storage {
+  use types.{api-error};
+
+  get:    func(key: string) -> result<option<list<u8>>, api-error>;
+  set:    func(key: string, value: list<u8>) -> result<_, api-error>;
+  delete: func(key: string) -> result<_, api-error>;
+  clear:  func() -> result<_, api-error>;
+  list-keys: func() -> result<list<string>, api-error>;   // keys only
+}
+
+// ── Push events (emit_event) ──────────────────────────────────────────────────
+// Plugin → host. Host applies a size + rate cap before forwarding (doc 49 M3).
+interface events {
+  use types.{api-error};
+  record plugin-event { kind: string, payload: list<u8> }
+  emit: func(event: plugin-event) -> result<_, api-error>;
+}
+
+// ── Logging (always available, never gated) ──────────────────────────────────
+interface log {
+  enum level { trace, debug, info, warn, error }
+  write: func(level: level, message: string);
+}
+
+// ── AI inference (ai:inference — the hard case, doc 53 §5) ────────────────────
+// Routes through HQAuthProxy on the MAIN isolate. Constrained request/response,
+// NOT direct model/Astrocyte access. No secret, key, raw memory, credential id,
+// or request id ever crosses this boundary. Async at the canonical-ABI level
+// (proven on Wasmtime 45, doc 53 §6.1); expressed here as a plain func because
+// WIT-level `async` is still unstable — the async lowering is applied at the
+// canon layer, not the interface text.
+interface inference {
+  use types.{api-error};
+
+  record chat-message { role: string, content: string }   // role: system|user|assistant
+  record inference-opts { max-tokens: u32, temperature: option<f32> }
+  record inference-response {
+    content: string,
+    input-tokens: u32,
+    output-tokens: u32,
+    model: string,       // model actually used (from user config); never the key
+  }
+
+  complete: func(messages: list<chat-message>, opts: inference-opts)
+    -> result<inference-response, api-error>;
+}
+
+// ── Plugin exports ────────────────────────────────────────────────────────────
+interface guest {
+  record plugin-metadata { id: string, version: string }
+  init: func();
+  run: func(input: list<u8>) -> result<list<u8>, string>;
+  metadata: func() -> plugin-metadata;
+}
+
+// ── The world ─────────────────────────────────────────────────────────────────
 world plugin {
-  // --- Standard WASI 0.3 (async) ---
-  // TODO(spike): pin the exact WASI 0.3 package version once Wasmtime 46 ships.
-  // include wasi:http/imports@0.3.0;
+  // hellohq-custom imports (host-implemented + gated app-side)
+  import types;
+  import workspace;
+  import storage;
+  import events;
+  import log;
+  import inference;
 
-  // --- hellohq host capabilities (custom; gated app-side) ---
-  // TODO(P2): read-only workspace queries, plugin:storage, emit-event, and the
-  // async streaming `ai:inference` host import.
-  // import hellohq:plugin/host@0.1.0;
+  // standard WASI — added when the wasi:* packages are vendored with the runtime
+  // (host-gated; H4/H5 SSRF live in the wasi:http impl). Capability denial for
+  // sockets/filesystem is structural (never imported):
+  //   import wasi:http/outgoing-handler@0.3.0;   // replaces network:fetch
+  //   import wasi:http/types@0.3.0;
+  //   import wasi:io/streams@0.3.0;
+  //   import wasi:io/poll@0.3.0;
+  //   import wasi:clocks/wall-clock@0.3.0;
+  //   import wasi:clocks/monotonic-clock@0.3.0;
 
-  // Plugin entry point (placeholder until the export contract is designed).
-  export run: func();
+  export guest;
 }
