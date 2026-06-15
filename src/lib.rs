@@ -329,7 +329,8 @@ pub unsafe extern "C" fn hwr_engine_free(ptr: *mut HwrEngine) {
 }
 
 /// Opaque instance handle: an instantiated component plus its owning store.
-#[cfg(feature = "compile")]
+/// Available on every build — instantiation/calling are runtime ops; only
+/// *compiling* from source needs Cranelift.
 pub struct HwrInstance {
     store: wasmtime::Store<()>,
     instance: wasmtime::component::Instance,
@@ -367,11 +368,10 @@ pub unsafe extern "C" fn hwr_instance_new(
     .unwrap_or(std::ptr::null_mut())
 }
 
-/// Releases an instance from [hwr_instance_new].
+/// Releases an instance handle.
 ///
 /// # Safety
-/// `ptr` must be a live [hwr_instance_new] handle, freed at most once.
-#[cfg(feature = "compile")]
+/// `ptr` must be a live instance handle, freed at most once.
 #[no_mangle]
 pub unsafe extern "C" fn hwr_instance_free(ptr: *mut HwrInstance) {
     if !ptr.is_null() {
@@ -384,8 +384,7 @@ pub unsafe extern "C" fn hwr_instance_free(ptr: *mut HwrInstance) {
 /// replaces this with the byte/host-import call ABI.)
 ///
 /// # Safety
-/// `inst` must be a live [hwr_instance_new] handle.
-#[cfg(feature = "compile")]
+/// `inst` must be a live instance handle.
 #[no_mangle]
 pub unsafe extern "C" fn hwr_instance_call_add(
     inst: *mut HwrInstance,
@@ -408,6 +407,87 @@ pub unsafe extern "C" fn hwr_instance_call_add(
     .ok()
     .flatten()
     .unwrap_or(i64::MIN)
+}
+
+/// Precompiles a Wasm **component** to a serialized artifact for [engine]'s
+/// backend (e.g. **Pulley bytecode** for the iOS target) — done off-device at
+/// build/publish time. Returns a heap buffer (length via `out_len`) the caller
+/// must release with [hwr_free_bytes], or null on failure. Requires Cranelift
+/// (the `compile` build).
+///
+/// # Safety
+/// `engine` must be a live [hwr_engine_new] handle; `bytes`/`len` readable;
+/// `out_len` writable.
+#[cfg(feature = "compile")]
+#[no_mangle]
+pub unsafe extern "C" fn hwr_precompile_component(
+    engine: *mut HwrEngine,
+    bytes: *const u8,
+    len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    if engine.is_null() || bytes.is_null() || out_len.is_null() {
+        return std::ptr::null_mut();
+    }
+    let eng = &(*engine).engine;
+    let wasm = std::slice::from_raw_parts(bytes, len);
+    let artifact = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eng.precompile_component(wasm).ok()
+    }))
+    .ok()
+    .flatten();
+    match artifact {
+        Some(v) => {
+            *out_len = v.len();
+            // Hand ownership of the boxed slice to C; reclaimed by hwr_free_bytes.
+            Box::into_raw(v.into_boxed_slice()) as *mut u8
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Releases a buffer returned by [hwr_precompile_component].
+///
+/// # Safety
+/// `ptr`/`len` must be exactly what [hwr_precompile_component] returned.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_free_bytes(ptr: *mut u8, len: usize) {
+    if !ptr.is_null() {
+        drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, len)));
+    }
+}
+
+/// Instantiates a component from a **precompiled artifact** (from
+/// [hwr_precompile_component]) — the **no-JIT / iOS path**: no Cranelift, just
+/// deserialize + run on the Pulley interpreter. Returns null on failure.
+/// Available on every build.
+///
+/// # Safety
+/// `engine` must be a live [hwr_engine_new] handle whose backend matches the
+/// artifact; `bytes`/`len` must be a trusted artifact from this runtime
+/// (deserializing untrusted bytes is unsound). Release with [hwr_instance_free].
+#[no_mangle]
+pub unsafe extern "C" fn hwr_instance_new_precompiled(
+    engine: *mut HwrEngine,
+    bytes: *const u8,
+    len: usize,
+) -> *mut HwrInstance {
+    if engine.is_null() || bytes.is_null() {
+        return std::ptr::null_mut();
+    }
+    let eng = &(*engine).engine;
+    let artifact = std::slice::from_raw_parts(bytes, len);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let component =
+            wasmtime::component::Component::deserialize(eng, artifact).ok()?;
+        let linker = wasmtime::component::Linker::new(eng);
+        let mut store = wasmtime::Store::new(eng, ());
+        let instance = linker.instantiate(&mut store, &component).ok()?;
+        Some(Box::into_raw(Box::new(HwrInstance { store, instance })))
+    }))
+    .ok()
+    .flatten()
+    .unwrap_or(std::ptr::null_mut())
 }
 
 #[cfg(test)]
@@ -511,6 +591,33 @@ mod tests {
             assert_eq!(hwr_instance_call_add(inst, 1, 2), 3);
             hwr_instance_free(inst);
             hwr_engine_free(eng);
+        }
+    }
+
+    #[cfg(feature = "compile")]
+    #[test]
+    fn precompile_then_deserialize_runs() {
+        // The iOS model: precompile to a Pulley artifact off-device (Cranelift),
+        // then deserialize + run with no compiler (Pulley interpreter only).
+        unsafe {
+            let ceng = hwr_engine_new(1); // pulley target
+            assert!(!ceng.is_null());
+            let wat = ADD_COMPONENT_WAT.as_bytes();
+            let mut out_len: usize = 0;
+            let artifact =
+                hwr_precompile_component(ceng, wat.as_ptr(), wat.len(), &mut out_len);
+            assert!(!artifact.is_null());
+            assert!(out_len > 0);
+
+            let reng = hwr_engine_new(1);
+            let inst = hwr_instance_new_precompiled(reng, artifact, out_len);
+            assert!(!inst.is_null());
+            assert_eq!(hwr_instance_call_add(inst, 20, 22), 42);
+
+            hwr_instance_free(inst);
+            hwr_engine_free(reng);
+            hwr_free_bytes(artifact, out_len);
+            hwr_engine_free(ceng);
         }
     }
 
