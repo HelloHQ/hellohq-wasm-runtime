@@ -21,6 +21,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # the iOS build can drop Cranelift (the JIT compiler) and ship only the runtime
 # + Pulley interpreter — the no-JIT payload the < 8 MB Spike-1 budget measures.
 wasmtime = { version = "45.0.1", default-features = false, features = [
+  "std",
   "runtime",
   "pulley",
   "component-model",

@@ -225,6 +225,131 @@ pub extern "C" fn hwr_run_async_double(use_pulley: i32, x: i32) -> i64 {
     .unwrap_or(i64::MIN)
 }
 
+// ── P1: handle-based engine + instance lifecycle ───────────────────────────
+//
+// The reusable runtime backbone, replacing the one-shot `hwr_eval_*` demo calls:
+// create an engine once, instantiate components against it, call exports, free.
+// The minimal `call_add` proof is superseded by the byte/host-import ABI at P2.
+
+/// Opaque engine handle (`wasmtime::Engine` + chosen backend).
+pub struct HwrEngine {
+    engine: wasmtime::Engine,
+}
+
+/// Creates a runtime engine on the chosen backend (`use_pulley`: 0 = Cranelift,
+/// non-zero = Pulley interpreter). Returns null on failure. Available on every
+/// build — engine creation needs no compiler.
+///
+/// # Safety
+/// The result must be released with [hwr_engine_free] exactly once.
+#[no_mangle]
+pub extern "C" fn hwr_engine_new(use_pulley: i32) -> *mut HwrEngine {
+    std::panic::catch_unwind(|| {
+        let mut cfg = wasmtime::Config::new();
+        if use_pulley != 0 {
+            cfg.target("pulley64").ok()?;
+        }
+        let engine = wasmtime::Engine::new(&cfg).ok()?;
+        Some(Box::into_raw(Box::new(HwrEngine { engine })))
+    })
+    .ok()
+    .flatten()
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Releases an engine from [hwr_engine_new].
+///
+/// # Safety
+/// `ptr` must be a live [hwr_engine_new] handle, freed at most once.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_engine_free(ptr: *mut HwrEngine) {
+    if !ptr.is_null() {
+        drop(Box::from_raw(ptr));
+    }
+}
+
+/// Opaque instance handle: an instantiated component plus its owning store.
+#[cfg(feature = "compile")]
+pub struct HwrInstance {
+    store: wasmtime::Store<()>,
+    instance: wasmtime::component::Instance,
+}
+
+/// Instantiates a Wasm **component** (binary, or WAT text in `compile` builds)
+/// against [engine]. Returns null on failure. P2 adds the WASI/host-import
+/// linker and the byte-oriented call ABI; the no-JIT deserialize path lands with
+/// precompiled components.
+///
+/// # Safety
+/// `engine` must be a live [hwr_engine_new] handle; `bytes`/`len` must describe
+/// readable memory. Release the result with [hwr_instance_free].
+#[cfg(feature = "compile")]
+#[no_mangle]
+pub unsafe extern "C" fn hwr_instance_new(
+    engine: *mut HwrEngine,
+    bytes: *const u8,
+    len: usize,
+) -> *mut HwrInstance {
+    if engine.is_null() || bytes.is_null() {
+        return std::ptr::null_mut();
+    }
+    let eng = &(*engine).engine;
+    let wasm = std::slice::from_raw_parts(bytes, len);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let component = wasmtime::component::Component::new(eng, wasm).ok()?;
+        let linker = wasmtime::component::Linker::new(eng);
+        let mut store = wasmtime::Store::new(eng, ());
+        let instance = linker.instantiate(&mut store, &component).ok()?;
+        Some(Box::into_raw(Box::new(HwrInstance { store, instance })))
+    }))
+    .ok()
+    .flatten()
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Releases an instance from [hwr_instance_new].
+///
+/// # Safety
+/// `ptr` must be a live [hwr_instance_new] handle, freed at most once.
+#[cfg(feature = "compile")]
+#[no_mangle]
+pub unsafe extern "C" fn hwr_instance_free(ptr: *mut HwrInstance) {
+    if !ptr.is_null() {
+        drop(Box::from_raw(ptr));
+    }
+}
+
+/// Calls the instance's `add(s32, s32) -> s32` export — a minimal proof of the
+/// reusable handle lifecycle. Returns the result, or `i64::MIN` on error. (P2
+/// replaces this with the byte/host-import call ABI.)
+///
+/// # Safety
+/// `inst` must be a live [hwr_instance_new] handle.
+#[cfg(feature = "compile")]
+#[no_mangle]
+pub unsafe extern "C" fn hwr_instance_call_add(
+    inst: *mut HwrInstance,
+    a: i32,
+    b: i32,
+) -> i64 {
+    if inst.is_null() {
+        return i64::MIN;
+    }
+    let h = &mut *inst;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let add = h
+            .instance
+            .get_typed_func::<(i32, i32), (i32,)>(&mut h.store, "add")
+            .ok()?;
+        let (r,) = add.call(&mut h.store, (a, b)).ok()?;
+        add.post_return(&mut h.store).ok()?;
+        Some(r as i64)
+    }))
+    .ok()
+    .flatten()
+    .unwrap_or(i64::MIN)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +420,35 @@ mod tests {
     #[test]
     fn async_double_c_abi() {
         assert_eq!(hwr_run_async_double(1, 21), 42);
+    }
+
+    #[cfg(feature = "compile")]
+    #[test]
+    fn handle_lifecycle_component() {
+        // The reusable P1 path: one engine → instantiate component → call → free,
+        // on the no-JIT Pulley backend.
+        unsafe {
+            let eng = hwr_engine_new(1);
+            assert!(!eng.is_null());
+            let wat = ADD_COMPONENT_WAT.as_bytes();
+            let inst = hwr_instance_new(eng, wat.as_ptr(), wat.len());
+            assert!(!inst.is_null());
+            assert_eq!(hwr_instance_call_add(inst, 20, 22), 42);
+            // A second call on the same instance reuses the store.
+            assert_eq!(hwr_instance_call_add(inst, 1, 2), 3);
+            hwr_instance_free(inst);
+            hwr_engine_free(eng);
+        }
+    }
+
+    #[test]
+    fn engine_handle_null_safe() {
+        // Freeing null and a fresh engine must not crash.
+        unsafe {
+            hwr_engine_free(std::ptr::null_mut());
+            let eng = hwr_engine_new(0);
+            assert!(!eng.is_null());
+            hwr_engine_free(eng);
+        }
     }
 }
