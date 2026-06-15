@@ -105,7 +105,10 @@ fn run_component_add(use_pulley: bool, a: i32, b: i32) -> wasmtime::Result<i32> 
 /// capability — `hq_read`, `plugin:storage`, `ai:inference`, and `wasi:http`
 /// are all component imports the host provides + gates. Here the import is
 /// implemented in Rust; P3 routes such imports to a Dart-serviced, gated
-/// callback. WASI 0.3's `wasi:http` itself needs Wasmtime 46.
+/// callback. The component-async runtime is available on 45 (see
+/// `run_component_async_double`); standard `wasi:http@0.3` packages mature with
+/// the wider WASI 0.3 ecosystem, but hellohq supplies its own gated host imports
+/// regardless (doc 53), so it is not blocked on that.
 #[cfg(feature = "compile")]
 const HOST_IMPORT_COMPONENT_WAT: &str = r#"(component
   (import "host-double" (func $double (param "x" u32) (result u32)))
@@ -143,9 +146,8 @@ fn run_component_host_import(use_pulley: bool, x: u32) -> wasmtime::Result<u32> 
 
 /// Core module importing an **async** host `double` and exporting `run` that
 /// calls it — proves a Wasm call can trigger an async host operation that
-/// suspends/resumes the Wasm fiber (the async-over-FFI mechanism). The
-/// component-async canonical ABI (WASI 0.3) lands on Wasmtime 46 and slots into
-/// the same bridge.
+/// suspends/resumes the Wasm fiber (the async-over-FFI mechanism). See
+/// `run_component_async_double` for the same at the **component** level.
 #[cfg(feature = "compile")]
 const ASYNC_WAT: &str = r#"(module
   (import "host" "double" (func $double (param i32) (result i32)))
@@ -176,6 +178,42 @@ async fn run_async_double(use_pulley: bool, x: i32) -> wasmtime::Result<i32> {
     let instance = linker.instantiate_async(&mut store, &module).await?;
     let run = instance.get_typed_func::<i32, i32>(&mut store, "run")?;
     run.call_async(&mut store, x).await
+}
+
+/// The **component-level** async path: instantiates [HOST_IMPORT_COMPONENT_WAT]
+/// with an **async** host import (`component::Linker::func_wrap_async`) and
+/// drives it with `component::TypedFunc::call_async`, with
+/// `Config::wasm_component_model_async(true)` enabled. This proves Component
+/// Model async runs on Wasmtime **45** (gated by the `component-model-async`
+/// feature) — the prerequisite for `ai:inference`/`wasi:http` as async component
+/// imports (doc 53), not deferred to 46. Returns `2·x`.
+///
+/// (This exercises an async *host import* under a component ABI + the async
+/// config switch; the fully-async *canonical* lift/lower used by `wasi:http`
+/// streams/futures is the next increment, also reachable on 45.)
+#[cfg(feature = "compile")]
+async fn run_component_async_double(use_pulley: bool, x: u32) -> wasmtime::Result<u32> {
+    use wasmtime::component::{Component, Linker};
+    let mut cfg = Config::new();
+    cfg.async_support(true);
+    cfg.wasm_component_model_async(true);
+    if use_pulley {
+        cfg.target("pulley64")?;
+    }
+    let engine = Engine::new(&cfg)?;
+    let component = Component::new(&engine, HOST_IMPORT_COMPONENT_WAT)?;
+    let mut linker = Linker::new(&engine);
+    linker.root().func_wrap_async(
+        "host-double",
+        |_store: wasmtime::StoreContextMut<'_, ()>, (v,): (u32,)| {
+            Box::new(async move { wasmtime::Result::Ok((v.wrapping_mul(2),)) })
+        },
+    )?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let run = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "run")?;
+    let (r,) = run.call_async(&mut store, (x,)).await?;
+    Ok(r)
 }
 
 /// Returns the C ABI version. Stable, dependency-free — the loader's handshake.
@@ -278,6 +316,26 @@ pub extern "C" fn hwr_eval_host_import(use_pulley: i32, x: i32) -> i64 {
 pub extern "C" fn hwr_run_async_double(use_pulley: i32, x: i32) -> i64 {
     std::panic::catch_unwind(|| {
         match pollster::block_on(run_async_double(use_pulley != 0, x)) {
+            Ok(v) => v as i64,
+            Err(_) => i64::MIN,
+        }
+    })
+    .unwrap_or(i64::MIN)
+}
+
+/// As [hwr_run_async_double] but the async import runs under a **component** ABI
+/// with Component Model Async enabled (Wasmtime 45, `component-model-async`).
+/// Proves the async component path — the basis for async `ai:inference` /
+/// `wasi:http` host imports (doc 53) — works on the shipped runtime version.
+/// Returns `2·x`, or `i64::MIN` on error.
+///
+/// # Safety
+/// None — takes no pointers.
+#[cfg(feature = "compile")]
+#[no_mangle]
+pub extern "C" fn hwr_run_component_async_double(use_pulley: i32, x: i32) -> i64 {
+    std::panic::catch_unwind(|| {
+        match pollster::block_on(run_component_async_double(use_pulley != 0, x as u32)) {
             Ok(v) => v as i64,
             Err(_) => i64::MIN,
         }
@@ -573,6 +631,33 @@ mod tests {
     #[test]
     fn async_double_c_abi() {
         assert_eq!(hwr_run_async_double(1, 21), 42);
+    }
+
+    #[cfg(feature = "compile")]
+    #[test]
+    fn cranelift_component_async() {
+        // Component Model Async on Wasmtime 45: async host import under a
+        // component ABI with wasm_component_model_async(true).
+        assert_eq!(
+            pollster::block_on(run_component_async_double(false, 21)).unwrap(),
+            42
+        );
+    }
+
+    #[cfg(feature = "compile")]
+    #[test]
+    fn pulley_component_async() {
+        // Same, no-JIT — the iOS backend runs async components too.
+        assert_eq!(
+            pollster::block_on(run_component_async_double(true, 21)).unwrap(),
+            42
+        );
+    }
+
+    #[cfg(feature = "compile")]
+    #[test]
+    fn component_async_c_abi() {
+        assert_eq!(hwr_run_component_async_double(1, 21), 42);
     }
 
     #[cfg(feature = "compile")]

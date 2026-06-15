@@ -25,6 +25,11 @@ wasmtime = { version = "45.0.1", default-features = false, features = [
   "runtime",
   "pulley",
   "component-model",
+  # Component Model Async (native `async func` / `future` / `stream`). Present
+  # in 45 behind this feature + `Config::wasm_component_model_async(true)`;
+  # Wasmtime 46 only flips it on by default. NOT Cranelift-dependent, so the
+  # no-JIT (iOS) build runs async components too.
+  "component-model-async",
   "async",
 ] }
 # Minimal executor to drive `call_async` to completion behind a synchronous C
