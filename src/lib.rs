@@ -195,7 +195,6 @@ async fn run_async_double(use_pulley: bool, x: i32) -> wasmtime::Result<i32> {
 async fn run_component_async_double(use_pulley: bool, x: u32) -> wasmtime::Result<u32> {
     use wasmtime::component::{Component, Linker};
     let mut cfg = Config::new();
-    cfg.async_support(true);
     cfg.wasm_component_model_async(true);
     if use_pulley {
         cfg.target("pulley64")?;
@@ -209,6 +208,50 @@ async fn run_component_async_double(use_pulley: bool, x: u32) -> wasmtime::Resul
             Box::new(async move { wasmtime::Result::Ok((v.wrapping_mul(2),)) })
         },
     )?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let run = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "run")?;
+    let (r,) = run.call_async(&mut store, (x,)).await?;
+    Ok(r)
+}
+
+/// A component whose export uses the **canonical async ABI** (callback variant
+/// + `task.return`) — the shape `wasi:http`/`stream`/`future` lift through, and
+/// the deeper piece beyond [run_component_async_double] (which is a *sync*-ABI
+/// export calling an async *host import*). Here the guest's own `run` is async:
+/// it computes, delivers its result via the `task.return` intrinsic, then
+/// returns `callback_code::EXIT` (0) to signal completion. No host imports —
+/// `task.return` is a canonical built-in.
+#[cfg(feature = "compile")]
+const CANON_ASYNC_WAT: &str = r#"(component
+  (core func $task_return (canon task.return (result u32)))
+  (core module $m
+    (import "" "task-return" (func $task_return (param i32)))
+    (func (export "run") (param i32) (result i32)
+      (call $task_return (i32.mul (local.get 0) (i32.const 2)))
+      (i32.const 0))                                 ;; callback_code::EXIT
+    (func (export "cb") (param i32 i32 i32) (result i32)
+      (i32.const 0)))
+  (core instance $i (instantiate $m
+    (with "" (instance (export "task-return" (func $task_return))))))
+  (func (export "run") (param "x" u32) (result u32)
+    (canon lift (core func $i "run") async (callback (func $i "cb")))))"#;
+
+/// Instantiates [CANON_ASYNC_WAT] and drives the **async-lifted** export with
+/// `call_async` (`wasm_component_model_async(true)`). Proves the canonical async
+/// lift — the `wasi:http` streaming substrate — compiles and runs on Wasmtime
+/// **45** under both backends. Returns `2·x`.
+#[cfg(feature = "compile")]
+async fn run_canonical_async_double(use_pulley: bool, x: u32) -> wasmtime::Result<u32> {
+    use wasmtime::component::{Component, Linker};
+    let mut cfg = Config::new();
+    cfg.wasm_component_model_async(true);
+    if use_pulley {
+        cfg.target("pulley64")?;
+    }
+    let engine = Engine::new(&cfg)?;
+    let component = Component::new(&engine, CANON_ASYNC_WAT)?;
+    let linker = Linker::new(&engine);
     let mut store = Store::new(&engine, ());
     let instance = linker.instantiate_async(&mut store, &component).await?;
     let run = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "run")?;
@@ -336,6 +379,24 @@ pub extern "C" fn hwr_run_async_double(use_pulley: i32, x: i32) -> i64 {
 pub extern "C" fn hwr_run_component_async_double(use_pulley: i32, x: i32) -> i64 {
     std::panic::catch_unwind(|| {
         match pollster::block_on(run_component_async_double(use_pulley != 0, x as u32)) {
+            Ok(v) => v as i64,
+            Err(_) => i64::MIN,
+        }
+    })
+    .unwrap_or(i64::MIN)
+}
+
+/// Drives the **canonical async-lift** component ([run_canonical_async_double])
+/// across the C ABI — the `wasi:http`/stream/future substrate (`task.return` +
+/// callback) proven on Wasmtime 45. Returns `2·x`, or `i64::MIN` on error.
+///
+/// # Safety
+/// None — takes no pointers.
+#[cfg(feature = "compile")]
+#[no_mangle]
+pub extern "C" fn hwr_run_canonical_async_double(use_pulley: i32, x: i32) -> i64 {
+    std::panic::catch_unwind(|| {
+        match pollster::block_on(run_canonical_async_double(use_pulley != 0, x as u32)) {
             Ok(v) => v as i64,
             Err(_) => i64::MIN,
         }
@@ -658,6 +719,25 @@ mod tests {
     #[test]
     fn component_async_c_abi() {
         assert_eq!(hwr_run_component_async_double(1, 21), 42);
+    }
+
+    #[cfg(feature = "compile")]
+    #[test]
+    fn cranelift_canonical_async_lift() {
+        // Canonical async ABI (task.return + callback) — the wasi:http shape.
+        assert_eq!(
+            pollster::block_on(run_canonical_async_double(false, 21)).unwrap(),
+            42
+        );
+    }
+
+    #[cfg(feature = "compile")]
+    #[test]
+    fn pulley_canonical_async_lift() {
+        assert_eq!(
+            pollster::block_on(run_canonical_async_double(true, 21)).unwrap(),
+            42
+        );
     }
 
     #[cfg(feature = "compile")]
