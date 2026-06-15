@@ -1,0 +1,99 @@
+name: Release
+
+# Cross-builds the Wasm runtime native libs and publishes a GitHub Release with
+# per-asset build-provenance attestation. Consumers (hellohq's
+# scripts/fetch-wasm-runtime-libs.sh) verify SHA-256 + attestation before
+# installing — a trust gate. Trigger by pushing a tag `vX.Y.Z`.
+#
+# Feature/platform matrix (docs 51/52): Cranelift JIT on desktop + Android,
+# Pulley (no JIT, --no-default-features) on iOS. See scripts/build-release.sh.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g. v0.1.0)
+        required: true
+
+permissions:
+  contents: write # create the release
+  id-token: write # provenance signing
+  attestations: write # attest-build-provenance
+
+jobs:
+  build:
+    name: Build · ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # iOS uses --no-default-features (Pulley, no Cranelift) and is assembled
+      # into a static xcframework by build-release.sh. Desktop darwin slices use
+      # default features (Cranelift JIT).
+      - name: Add Apple targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios-sim
+
+      # Android jniLibs (arm64-v8a, armeabi-v7a, x86_64), default features /
+      # Cranelift. The ubuntu runner ships an NDK; build-release.sh keys off
+      # ANDROID_NDK_HOME + cargo-ndk (installed here only on Linux, so the macOS
+      # job won't also build Android).
+      - name: Set up Android cross-build
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+          cargo install cargo-ndk --locked
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}}" >> "$GITHUB_ENV"
+
+      - name: Build native libs
+        shell: bash
+        run: bash scripts/build-release.sh "${{ runner.temp }}/dist"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    name: Publish + attest
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: in
+          pattern: dist-*
+          merge-multiple: true
+
+      # Flatten the per-OS dist/ trees into a single set of release assets, then
+      # recompute one combined SHA256SUMS over the flattened basenames (each
+      # asset basename is unique across platforms). The xcframework / jniLibs are
+      # already zipped by build-release.sh.
+      - name: Stage assets (flatten, drop per-OS SHA256SUMS, recompute combined)
+        shell: bash
+        run: |
+          mkdir -p assets
+          find in -type f ! -name SHA256SUMS -exec cp {} assets/ \;
+          cd assets && sha256sum * | tee SHA256SUMS
+
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: assets/*
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" assets/* --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" --generate-notes
