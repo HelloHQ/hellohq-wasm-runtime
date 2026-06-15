@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Release staging / platform artifacts (built by CI, never committed)
+/dist
+*.dylib
+*.so
+*.dll
+*.a
+*.xcframework
+*.xcframework.zip

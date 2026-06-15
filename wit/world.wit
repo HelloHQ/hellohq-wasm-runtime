@@ -1,0 +1,30 @@
+// DRAFT — the HelloHQ Tier-2 plugin component world.
+//
+// Interface shapes are settled during the P0 spike (doc 52) and P2 against the
+// real WASI 0.3 packages; this file documents intent, it is not yet wired to
+// wit-bindgen / cargo-component.
+//
+// Design notes:
+//   - Outbound HTTP is the STANDARD `wasi:http` interface (async), so plugins
+//     are portable/language-agnostic. The host implements + GATES it app-side
+//     (origin allowlist + SSRF/private-IP blocking). `wasi:sockets` is NOT
+//     included — raw sockets are too broad an attack surface for plugins.
+//   - hellohq-specific capabilities (workspace reads, storage, events, and the
+//     async `ai:inference` that motivates this runtime) are custom interfaces
+//     alongside WASI, also gated app-side.
+
+package hellohq:plugin@0.1.0;
+
+world plugin {
+  // --- Standard WASI 0.3 (async) ---
+  // TODO(spike): pin the exact WASI 0.3 package version once Wasmtime 46 ships.
+  // include wasi:http/imports@0.3.0;
+
+  // --- hellohq host capabilities (custom; gated app-side) ---
+  // TODO(P2): read-only workspace queries, plugin:storage, emit-event, and the
+  // async streaming `ai:inference` host import.
+  // import hellohq:plugin/host@0.1.0;
+
+  // Plugin entry point (placeholder until the export contract is designed).
+  export run: func();
+}

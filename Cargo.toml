@@ -1,0 +1,45 @@
+[package]
+name = "hellohq-wasm-runtime"
+version = "0.0.1"
+edition = "2021"
+description = "Async-first WebAssembly plugin runtime: Wasmtime (Component Model + WASI 0.3 async) over a C ABI, built for async host capabilities like streaming AI inference."
+license = "Apache-2.0"
+repository = "https://github.com/HelloHQ/hellohq-wasm-runtime"
+keywords = ["webassembly", "wasmtime", "wasi", "component-model", "ffi"]
+categories = ["wasm", "api-bindings"]
+publish = false
+
+[lib]
+name = "hellohq_wasm_runtime"
+# staticlib → iOS / static linking; cdylib → desktop/Android shared lib; rlib → tests.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+# Pinned via `cargo add` (exact published version in Cargo.lock). 45.0.1 is the
+# latest published; the spike/P1 bump to Wasmtime 46 lands WASI 0.3 + Component
+# Model Async by default. We disable default features and opt in explicitly so
+# the iOS build can drop Cranelift (the JIT compiler) and ship only the runtime
+# + Pulley interpreter — the no-JIT payload the < 8 MB Spike-1 budget measures.
+wasmtime = { version = "45.0.1", default-features = false, features = [
+  "runtime",
+  "pulley",
+  "component-model",
+  "async",
+] }
+# Minimal executor to drive `call_async` to completion behind a synchronous C
+# entrypoint — the "block on a blockable worker isolate" bridge (docs 51/52).
+pollster = { version = "0.4.0", optional = true }
+
+[features]
+# Desktop / Android / CI: in-process Cranelift compilation + `wat` parsing +
+# the async block_on executor. iOS builds with `--no-default-features` → runtime
+# + Pulley interpreter only (modules precompiled off-device; Cranelift unshipped).
+default = ["compile"]
+compile = ["wasmtime/cranelift", "wasmtime/wat", "dep:pollster"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+# panic = unwind (default) so the FFI entrypoints' catch_unwind converts any
+# panic into an error return instead of unwinding across the C boundary.
