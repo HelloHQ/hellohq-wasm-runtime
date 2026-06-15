@@ -100,6 +100,47 @@ fn run_component_add(use_pulley: bool, a: i32, b: i32) -> wasmtime::Result<i32> 
     Ok(result)
 }
 
+/// P2 primitive: a **component that imports a host function** (`host-double`)
+/// and exports `run` that calls it. This is the mechanism behind every hellohq
+/// capability — `hq_read`, `plugin:storage`, `ai:inference`, and `wasi:http`
+/// are all component imports the host provides + gates. Here the import is
+/// implemented in Rust; P3 routes such imports to a Dart-serviced, gated
+/// callback. WASI 0.3's `wasi:http` itself needs Wasmtime 46.
+#[cfg(feature = "compile")]
+const HOST_IMPORT_COMPONENT_WAT: &str = r#"(component
+  (import "host-double" (func $double (param "x" u32) (result u32)))
+  (core func $double_core (canon lower (func $double)))
+  (core module $m
+    (import "host" "double" (func $d (param i32) (result i32)))
+    (func (export "run") (param i32) (result i32)
+      local.get 0 call $d))
+  (core instance $i (instantiate $m
+    (with "host" (instance (export "double" (func $double_core))))))
+  (func (export "run") (param "x" u32) (result u32)
+    (canon lift (core func $i "run"))))"#;
+
+/// Instantiates [HOST_IMPORT_COMPONENT_WAT], providing `host-double` from Rust,
+/// and calls `run(x)` (which calls back into the host). Returns `2·x`.
+#[cfg(feature = "compile")]
+fn run_component_host_import(use_pulley: bool, x: u32) -> wasmtime::Result<u32> {
+    use wasmtime::component::{Component, Linker};
+    let engine = make_engine(use_pulley)?;
+    let component = Component::new(&engine, HOST_IMPORT_COMPONENT_WAT)?;
+    let mut linker = Linker::new(&engine);
+    linker.root().func_wrap(
+        "host-double",
+        |_store: wasmtime::StoreContextMut<'_, ()>,
+         (v,): (u32,)|
+         -> wasmtime::Result<(u32,)> { Ok((v.wrapping_mul(2),)) },
+    )?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &component)?;
+    let run = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "run")?;
+    let (r,) = run.call(&mut store, (x,))?;
+    run.post_return(&mut store)?;
+    Ok(r)
+}
+
 /// Core module importing an **async** host `double` and exporting `run` that
 /// calls it — proves a Wasm call can trigger an async host operation that
 /// suspends/resumes the Wasm fiber (the async-over-FFI mechanism). The
@@ -202,6 +243,25 @@ pub extern "C" fn hwr_eval_component_add(use_pulley: i32, a: i32, b: i32) -> i64
         Ok(v) => v as i64,
         Err(_) => i64::MIN,
     })
+    .unwrap_or(i64::MIN)
+}
+
+/// Runs a component that **imports a host function** and calls it; the host
+/// import is provided from Rust. Returns `2·x`, or `i64::MIN` on error. Proves
+/// the host-import mechanism — the foundation for WASI/hellohq capabilities —
+/// across the C ABI on both backends.
+///
+/// # Safety
+/// None — takes no pointers.
+#[cfg(feature = "compile")]
+#[no_mangle]
+pub extern "C" fn hwr_eval_host_import(use_pulley: i32, x: i32) -> i64 {
+    std::panic::catch_unwind(
+        || match run_component_host_import(use_pulley != 0, x as u32) {
+            Ok(v) => v as i64,
+            Err(_) => i64::MIN,
+        },
+    )
     .unwrap_or(i64::MIN)
 }
 
@@ -401,6 +461,19 @@ mod tests {
     #[test]
     fn component_c_abi() {
         assert_eq!(hwr_eval_component_add(1, 2, 3), 5);
+    }
+
+    #[cfg(feature = "compile")]
+    #[test]
+    fn cranelift_component_host_import() {
+        assert_eq!(run_component_host_import(false, 21).unwrap(), 42);
+    }
+
+    #[cfg(feature = "compile")]
+    #[test]
+    fn pulley_component_host_import() {
+        // A component calling back into a host import works under no-JIT too.
+        assert_eq!(run_component_host_import(true, 21).unwrap(), 42);
     }
 
     #[cfg(feature = "compile")]
