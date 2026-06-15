@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Clang module map exposing the hand-maintained C ABI header as a module named
+// `HelloHQWasmRuntime`, so Swift consumers can `import HelloHQWasmRuntime`.
+// Shipped inside each slice's Headers/ dir of the xcframework (see
+// scripts/build-release.sh, which passes `-headers include/` to xcodebuild).
+module HelloHQWasmRuntime {
+    header "hellohq_wasm_runtime.h"
+    export *
+}

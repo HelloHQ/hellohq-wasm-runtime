@@ -10,3 +10,6 @@
 *.a
 *.xcframework
 *.xcframework.zip
+
+# Generated benchmark artifact (regenerate via gen_bench_artifact)
+ios-bench/Resources/*.cwasm

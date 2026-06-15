@@ -109,10 +109,15 @@ build_ios() {
   mkdir -p "$dev_dir" "$sim_dir"
   cp "$dev_lib" "$dev_dir/$STATICLIB"
 
-  local xc_args=(-library "$dev_dir/$STATICLIB")
+  # Header dir bundled into every slice's Headers/ so the resulting xcframework
+  # is importable as a Clang module (`import HelloHQWasmRuntime` from Swift).
+  # Contains the hand-maintained C ABI header + its module.modulemap.
+  local hdr_dir="$CRATE_DIR/include"
+
+  local xc_args=(-library "$dev_dir/$STATICLIB" -headers "$hdr_dir")
   if [ "${#sim_inputs[@]}" -gt 0 ]; then
     lipo -create "${sim_inputs[@]}" -output "$sim_dir/$STATICLIB"
-    xc_args+=(-library "$sim_dir/$STATICLIB")
+    xc_args+=(-library "$sim_dir/$STATICLIB" -headers "$hdr_dir")
   else
     echo "⚠ no iOS simulator targets installed; xcframework will contain device slice only"
   fi
