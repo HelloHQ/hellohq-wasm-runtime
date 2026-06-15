@@ -1,0 +1,11 @@
+// Test-only world (same hellohq:plugin package) for the P2 Option A end-to-end
+// typed-marshaling test. A guest built against this world imports the gated
+// `workspace` interface, calls `read-portfolio-names`, and re-exports what it
+// received — so the host test can assert a typed `list<portfolio-name>` survives
+// host -> guest (import result) -> host (export result). NOT shipped to plugins;
+// the real plugin world is `plugin` in world.wit.
+world workspace-probe {
+  use types.{portfolio-name};
+  import workspace;
+  export read-names: func() -> list<portfolio-name>;
+}

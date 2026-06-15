@@ -25,12 +25,14 @@
 //! - `hwr_run_async_double` / `_component_async_double` / `_canonical_async_double`
 //!   — async host imports + the canonical async ABI (`task.return`), on
 //!   Wasmtime 45 (no 46 needed; see hellohq doc 53 §6.1).
-//! - `hwr_read_portfolio_count` — first **gated `workspace` host import** against
-//!   the doc-53 WIT world (`wit/world.wit`), the gate as chokepoint (P2 Option A).
+//! - `hwr_read_portfolio_count` — gated `workspace` host import against the doc-53
+//!   WIT world (`wit/world.wit`), the gate as chokepoint (P2 Option A).
+//! - **P2 Option A complete:** typed `list<portfolio-name>` round-trips
+//!   host → guest → host through a real `wit-bindgen` guest component, gated, both
+//!   backends (`tests/workspace_probe.rs`, `bindgen!` host impl).
 //!
-//! Still ahead: typed `list`/`string` marshaling via wit-bindgen/cargo-component;
-//! the `wasi:http` host impl (H4/H5); the Dart-serviced gate round-trip (P3);
-//! on-device A-series latency (hardware).
+//! Still ahead: the `wasi:http` host impl (H4/H5, Option B); the Dart-serviced
+//! gate round-trip (P3); on-device A-series latency (hardware).
 //!
 //! Safety: every `extern "C"` entrypoint must `catch_unwind` and never let a
 //! panic cross the FFI boundary (see `Cargo.toml` `panic = unwind`).
@@ -134,9 +136,9 @@ fn run_component_host_import(use_pulley: bool, x: u32) -> wasmtime::Result<u32> 
     let mut linker = Linker::new(&engine);
     linker.root().func_wrap(
         "host-double",
-        |_store: wasmtime::StoreContextMut<'_, ()>,
-         (v,): (u32,)|
-         -> wasmtime::Result<(u32,)> { Ok((v.wrapping_mul(2),)) },
+        |_store: wasmtime::StoreContextMut<'_, ()>, (v,): (u32,)| -> wasmtime::Result<(u32,)> {
+            Ok((v.wrapping_mul(2),))
+        },
     )?;
     let mut store = Store::new(&engine, ());
     let instance = linker.instantiate(&mut store, &component)?;
@@ -174,11 +176,7 @@ const WORKSPACE_READ_COMPONENT_WAT: &str = r#"(component
 /// [WORKSPACE_READ_DENIED]. Proves a real hellohq read capability flows through
 /// the component world and the gate, on both backends.
 #[cfg(feature = "compile")]
-fn run_gated_workspace_read(
-    use_pulley: bool,
-    granted: bool,
-    count: u32,
-) -> wasmtime::Result<u32> {
+fn run_gated_workspace_read(use_pulley: bool, granted: bool, count: u32) -> wasmtime::Result<u32> {
     use wasmtime::component::{Component, Linker};
     let engine = make_engine(use_pulley)?;
     let component = Component::new(&engine, WORKSPACE_READ_COMPONENT_WAT)?;
@@ -187,7 +185,11 @@ fn run_gated_workspace_read(
         "read-portfolio-names",
         move |_store: wasmtime::StoreContextMut<'_, ()>, _: ()| -> wasmtime::Result<(u32,)> {
             // The gate. Ungranted reads never reach workspace data.
-            Ok((if granted { count } else { WORKSPACE_READ_DENIED },))
+            Ok((if granted {
+                count
+            } else {
+                WORKSPACE_READ_DENIED
+            },))
         },
     )?;
     let mut store = Store::new(&engine, ());
@@ -218,14 +220,10 @@ async fn run_async_double(use_pulley: bool, x: i32) -> wasmtime::Result<i32> {
     let engine = Engine::new(&cfg)?;
     let module = Module::new(&engine, ASYNC_WAT)?;
     let mut linker = Linker::new(&engine);
-    linker.func_wrap_async(
-        "host",
-        "double",
-        |_caller: Caller<'_, ()>, (v,): (i32,)| {
-            // The Wasm guest suspends here while this future runs, then resumes.
-            Box::new(async move { wasmtime::Result::Ok(v.wrapping_mul(2)) })
-        },
-    )?;
+    linker.func_wrap_async("host", "double", |_caller: Caller<'_, ()>, (v,): (i32,)| {
+        // The Wasm guest suspends here while this future runs, then resumes.
+        Box::new(async move { wasmtime::Result::Ok(v.wrapping_mul(2)) })
+    })?;
     let mut store = Store::new(&engine, ());
     let instance = linker.instantiate_async(&mut store, &module).await?;
     let run = instance.get_typed_func::<i32, i32>(&mut store, "run")?;
@@ -267,8 +265,8 @@ async fn run_component_async_double(use_pulley: bool, x: u32) -> wasmtime::Resul
     Ok(r)
 }
 
-/// A component whose export uses the **canonical async ABI** (callback variant
-/// + `task.return`) — the shape `wasi:http`/`stream`/`future` lift through, and
+/// A component whose export uses the **canonical async ABI** (callback variant +
+/// `task.return`) — the shape `wasi:http`/`stream`/`future` lift through, and
 /// the deeper piece beyond [run_component_async_double] (which is a *sync*-ABI
 /// export calling an async *host import*). Here the guest's own `run` is async:
 /// it computes, delivers its result via the `task.return` intrinsic, then
@@ -409,12 +407,12 @@ pub extern "C" fn hwr_eval_host_import(use_pulley: i32, x: i32) -> i64 {
 #[cfg(feature = "compile")]
 #[no_mangle]
 pub extern "C" fn hwr_run_async_double(use_pulley: i32, x: i32) -> i64 {
-    std::panic::catch_unwind(|| {
-        match pollster::block_on(run_async_double(use_pulley != 0, x)) {
+    std::panic::catch_unwind(
+        || match pollster::block_on(run_async_double(use_pulley != 0, x)) {
             Ok(v) => v as i64,
             Err(_) => i64::MIN,
-        }
-    })
+        },
+    )
     .unwrap_or(i64::MIN)
 }
 
@@ -577,11 +575,7 @@ pub unsafe extern "C" fn hwr_instance_free(ptr: *mut HwrInstance) {
 /// # Safety
 /// `inst` must be a live instance handle.
 #[no_mangle]
-pub unsafe extern "C" fn hwr_instance_call_add(
-    inst: *mut HwrInstance,
-    a: i32,
-    b: i32,
-) -> i64 {
+pub unsafe extern "C" fn hwr_instance_call_add(inst: *mut HwrInstance, a: i32, b: i32) -> i64 {
     if inst.is_null() {
         return i64::MIN;
     }
@@ -643,7 +637,7 @@ pub unsafe extern "C" fn hwr_precompile_component(
 #[no_mangle]
 pub unsafe extern "C" fn hwr_free_bytes(ptr: *mut u8, len: usize) {
     if !ptr.is_null() {
-        drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, len)));
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
     }
 }
 
@@ -668,8 +662,7 @@ pub unsafe extern "C" fn hwr_instance_new_precompiled(
     let eng = &(*engine).engine;
     let artifact = std::slice::from_raw_parts(bytes, len);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let component =
-            wasmtime::component::Component::deserialize(eng, artifact).ok()?;
+        let component = wasmtime::component::Component::deserialize(eng, artifact).ok()?;
         let linker = wasmtime::component::Linker::new(eng);
         let mut store = wasmtime::Store::new(eng, ());
         let instance = linker.instantiate(&mut store, &component).ok()?;
@@ -833,7 +826,10 @@ mod tests {
     #[test]
     fn workspace_read_c_abi() {
         assert_eq!(hwr_read_portfolio_count(1, 1, 5), 5);
-        assert_eq!(hwr_read_portfolio_count(1, 0, 5), WORKSPACE_READ_DENIED as i64);
+        assert_eq!(
+            hwr_read_portfolio_count(1, 0, 5),
+            WORKSPACE_READ_DENIED as i64
+        );
     }
 
     #[cfg(feature = "compile")]
@@ -865,8 +861,7 @@ mod tests {
             assert!(!ceng.is_null());
             let wat = ADD_COMPONENT_WAT.as_bytes();
             let mut out_len: usize = 0;
-            let artifact =
-                hwr_precompile_component(ceng, wat.as_ptr(), wat.len(), &mut out_len);
+            let artifact = hwr_precompile_component(ceng, wat.as_ptr(), wat.len(), &mut out_len);
             assert!(!artifact.is_null());
             assert!(out_len > 0);
 

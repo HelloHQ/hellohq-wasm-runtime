@@ -20,8 +20,8 @@
 #[cfg(feature = "ios-bench")]
 fn main() {
     use hellohq_wasm_runtime::{
-        hwr_abi_version, hwr_engine_free, hwr_engine_new, hwr_instance_call_add,
-        hwr_instance_free, hwr_instance_new_precompiled, hwr_self_test,
+        hwr_abi_version, hwr_engine_free, hwr_engine_new, hwr_instance_call_add, hwr_instance_free,
+        hwr_instance_new_precompiled, hwr_self_test,
     };
     use std::time::Instant;
 
@@ -31,15 +31,21 @@ fn main() {
     // Sentinel returned by the call ABI on error (i64::MIN).
     const ERR: i64 = i64::MIN;
 
-    println!("hellohq-wasm-runtime bench_ios  (abi v{})", hwr_abi_version());
-    assert_eq!(hwr_self_test(), 1, "self_test failed — runtime did not init");
+    println!(
+        "hellohq-wasm-runtime bench_ios  (abi v{})",
+        hwr_abi_version()
+    );
+    assert_eq!(
+        hwr_self_test(),
+        1,
+        "self_test failed — runtime did not init"
+    );
     println!("self_test: OK  (no-JIT runtime links + initialises under iOS)");
 
     unsafe {
         let engine = hwr_engine_new(1 /* pulley */);
         assert!(!engine.is_null(), "engine_new returned null");
-        let inst =
-            hwr_instance_new_precompiled(engine, ARTIFACT.as_ptr(), ARTIFACT.len());
+        let inst = hwr_instance_new_precompiled(engine, ARTIFACT.as_ptr(), ARTIFACT.len());
         assert!(
             !inst.is_null(),
             "deserialize failed — host-precompiled artifact rejected by no-JIT runtime"
@@ -52,9 +58,11 @@ fn main() {
 
         // ── Latency ──────────────────────────────────────────────────────────
         println!("\nlatency (Pulley, no-JIT):");
-        for (label, n, iters) in
-            [("light  (n=10k)", 10_000, 2000), ("medium (n=100k)", 100_000, 500), ("heavy  (n=1M)", 1_000_000, 100)]
-        {
+        for (label, n, iters) in [
+            ("light  (n=10k)", 10_000, 2000),
+            ("medium (n=100k)", 100_000, 500),
+            ("heavy  (n=1M)", 1_000_000, 100),
+        ] {
             // warm up
             let _ = hwr_instance_call_add(inst, n, 0);
             let t = Instant::now();

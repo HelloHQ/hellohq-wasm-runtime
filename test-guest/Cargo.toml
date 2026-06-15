@@ -1,0 +1,29 @@
+# Isolated guest crate for the P2 Option A typed-marshaling proof. Built for
+# wasm32-unknown-unknown (NO wasi), turned into a component with wasm-tools, and
+# committed as a fixture at ../tests/fixtures/workspace_probe_guest.wasm.
+#
+# The empty [workspace] table makes this its own workspace root so it never
+# joins the parent crate's build — `cargo test` / `cargo build` for
+# hellohq-wasm-runtime are unaffected. Regen command: see ../tests/fixtures/README.md.
+[workspace]
+
+[package]
+name = "workspace-probe-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Guest-side bindings generator. no_std-capable; we provide our own allocator
+# (dlmalloc) so the guest imports NO wasi — the host test linker provides only
+# `hellohq:plugin/workspace`, so any wasi import would fail instantiation.
+wit-bindgen = { version = "0.58.0", default-features = false, features = ["macros"] }
+dlmalloc = { version = "0.2", features = ["global"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

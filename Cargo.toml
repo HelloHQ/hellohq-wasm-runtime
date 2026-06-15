@@ -47,6 +47,21 @@ compile = ["wasmtime/cranelift", "wasmtime/wat", "dep:pollster"]
 # default `cargo test`/`cargo build` never needs the generated file present.
 ios-bench = []
 
+# Examples gated by the features they need, so `cargo build --no-default-features
+# [--examples]` (the iOS no-JIT link check) never tries to compile a Cranelift-only
+# example. bench_ios runs the no-JIT path → needs only `ios-bench`.
+[[example]]
+name = "pulley_latency"
+required-features = ["compile"]
+
+[[example]]
+name = "gen_bench_artifact"
+required-features = ["compile"]
+
+[[example]]
+name = "bench_ios"
+required-features = ["ios-bench"]
+
 [profile.release]
 opt-level = "z"
 lto = true

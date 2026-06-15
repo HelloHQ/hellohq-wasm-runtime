@@ -13,3 +13,6 @@
 
 # Generated benchmark artifact (regenerate via gen_bench_artifact)
 ios-bench/Resources/*.cwasm
+
+# Guest fixture crate build output (regenerate via scripts/regen_probe_guest.sh)
+/test-guest/target
