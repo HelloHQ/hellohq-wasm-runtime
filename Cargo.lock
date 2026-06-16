@@ -453,6 +453,7 @@ name = "hellohq-wasm-runtime"
 version = "0.0.1"
 dependencies = [
  "futures-channel",
+ "futures-util",
  "pollster",
  "wasmtime",
 ]

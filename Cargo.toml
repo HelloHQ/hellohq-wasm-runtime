@@ -37,9 +37,12 @@ wasmtime = { version = "45.0.1", default-features = false, features = [
 # Base (non-optional) because the P3 host-call round-trip must work on the iOS
 # no-JIT build too, not only `compile` builds.
 pollster = "0.4.0"
-# Oneshot channel for the P3 round-trip: the host import awaits a value the
-# caller (Dart) supplies via `hwr_p3_resolve` from another thread.
+# Oneshot + mpsc channels for the P3 round-trip: the host import awaits a value
+# the caller (Dart) supplies via `hwr_p3_resolve`/streaming push from another
+# thread. `futures-util` gives the async `StreamExt::next` for the streaming
+# (P3 v2) inbound channel.
 futures-channel = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [features]
 # Desktop / Android / CI: in-process Cranelift compilation + `wat` parsing +
@@ -51,7 +54,12 @@ compile = ["wasmtime/cranelift", "wasmtime/wat"]
 # include_bytes! (run `gen_bench_artifact` first). Kept behind a feature so the
 # default `cargo test`/`cargo build` never needs the generated file present.
 ios-bench = []
-wasi-http-probe = []
+# The hand-built wasi:http@0.3-rc host (STAGE 1: resource host scaffolding).
+# Behind a feature so default/no-default builds are unaffected. Needs cranelift
+# (the linker/engine in the unit test compiles a config) — implied via `compile`
+# is NOT required since the test builds only an Engine, but the bindgen output
+# uses component-model-async which is in the base wasmtime features.
+wasi-http = []
 
 # Examples gated by the features they need, so `cargo build --no-default-features
 # [--examples]` (the iOS no-JIT link check) never tries to compile a Cranelift-only

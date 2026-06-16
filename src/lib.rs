@@ -39,8 +39,12 @@
 
 /// C ABI version. Bumped on any breaking change to the exported surface so the
 /// Dart `dart:ffi` loader can refuse a mismatched native library.
-#[cfg(feature = "wasi-http-probe")]
-mod wasi_http_probe;
+// STAGE 1 scaffolding: the host state + trait impls are exercised by the
+// module's own unit tests and consumed by later stages (the C ABI wiring lands
+// when streaming does). Until then the non-test build sees them as unused.
+#[cfg(feature = "wasi-http")]
+#[allow(dead_code)]
+mod wasi_http;
 
 pub const HWR_ABI_VERSION: u32 = 1;
 
@@ -1026,6 +1030,255 @@ pub unsafe extern "C" fn hwr_p3_free(session: *mut HwrP3Session) {
     }
 }
 
+// ── P3 v2: streaming host-call round-trip (framed bidirectional channel) ─────
+//
+// The atomic P3 above is one request -> one response. wasi:http (Option B) needs
+// to STREAM bodies: the request body flows OUT (host -> caller) chunk by chunk,
+// the response body flows IN (caller -> host). This bridge frames that exchange:
+//   - The worker runs a `driver(out, in_rx)` future. It emits outbound chunks via
+//     `out.chunk(..)` / `out.end()` and consumes inbound chunks by awaiting
+//     `in_rx` (closed by the caller via `hwr_p3s_push_end`).
+//   - The caller drains OUT/OUT_END with `hwr_p3s_poll`, then pushes IN chunks
+//     with `hwr_p3s_push` + `hwr_p3s_push_end`, then polls for DONE.
+// Stage 3 plugs the wasi:http `handle` in as the driver; stage 2 (here) is the
+// transport, proven with a synthetic driver in the tests.
+
+/// `hwr_p3s_poll` status.
+pub const HWR_P3S_OUT: i32 = 0; // an outbound chunk is available (read via out ptr/len)
+pub const HWR_P3S_OUT_END: i32 = 1; // outbound stream finished; now push inbound
+pub const HWR_P3S_DONE: i32 = 2; // run finished OK (read result)
+pub const HWR_P3S_ERROR: i32 = 3; // run errored (result holds a message)
+
+enum P3sEvent {
+    Out(Vec<u8>),
+    OutEnd,
+    Done(Result<Vec<u8>, String>),
+}
+
+/// Handed to the driver: emit outbound chunks (the request body) to the caller.
+pub struct P3sOut {
+    tx: std::sync::mpsc::Sender<P3sEvent>,
+}
+
+// `chunk`/`end` are called by the driver (the wasi:http `handle` in stage 3; a
+// synthetic driver in tests today).
+#[allow(dead_code)]
+impl P3sOut {
+    fn chunk(&self, bytes: Vec<u8>) {
+        let _ = self.tx.send(P3sEvent::Out(bytes));
+    }
+    fn end(&self) {
+        let _ = self.tx.send(P3sEvent::OutEnd);
+    }
+}
+
+/// Inbound chunks (the response body) the caller pushes; the driver awaits them.
+type P3sIn = futures_channel::mpsc::UnboundedReceiver<Vec<u8>>;
+
+/// A streaming host-call in flight. Opaque to the C ABI.
+pub struct HwrP3Stream {
+    rx: std::sync::mpsc::Receiver<P3sEvent>,
+    in_tx: Option<futures_channel::mpsc::UnboundedSender<Vec<u8>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    current_out: Vec<u8>,
+    result: Vec<u8>,
+    finished: bool,
+}
+
+/// Spawn a streaming session driven by `driver`. The driver owns the outbound
+/// emitter + the inbound receiver and returns the run's final result bytes.
+/// Wired to a C entrypoint with the wasi:http `handle` driver in stage 3; used
+/// by the synthetic streaming test today.
+#[allow(dead_code)]
+fn p3s_run_session<F, Fut>(driver: F) -> HwrP3Stream
+where
+    F: FnOnce(P3sOut, P3sIn) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
+{
+    let (tx, rx) = std::sync::mpsc::channel::<P3sEvent>();
+    let (in_tx, in_rx) = futures_channel::mpsc::unbounded::<Vec<u8>>();
+    let done_tx = tx.clone();
+    let thread = std::thread::spawn(move || {
+        let out = P3sOut { tx };
+        let result = pollster::block_on(driver(out, in_rx));
+        let _ = done_tx.send(P3sEvent::Done(result));
+    });
+    HwrP3Stream {
+        rx,
+        in_tx: Some(in_tx),
+        thread: Some(thread),
+        current_out: Vec::new(),
+        result: Vec::new(),
+        finished: false,
+    }
+}
+
+impl HwrP3Stream {
+    fn poll(&mut self) -> i32 {
+        if self.finished {
+            return HWR_P3S_DONE;
+        }
+        match self.rx.recv() {
+            Ok(P3sEvent::Out(chunk)) => {
+                self.current_out = chunk;
+                HWR_P3S_OUT
+            }
+            Ok(P3sEvent::OutEnd) => HWR_P3S_OUT_END,
+            Ok(P3sEvent::Done(Ok(out))) => {
+                self.result = out;
+                self.finished = true;
+                HWR_P3S_DONE
+            }
+            Ok(P3sEvent::Done(Err(msg))) => {
+                self.result = msg.into_bytes();
+                self.finished = true;
+                HWR_P3S_ERROR
+            }
+            Err(_) => {
+                self.finished = true;
+                HWR_P3S_ERROR
+            }
+        }
+    }
+
+    fn out_chunk(&self) -> &[u8] {
+        &self.current_out
+    }
+
+    fn push(&mut self, chunk: Vec<u8>) {
+        if let Some(tx) = &self.in_tx {
+            let _ = tx.unbounded_send(chunk);
+        }
+    }
+
+    /// Close the inbound stream — the driver's `in_rx` then yields `None`.
+    fn push_end(&mut self) {
+        self.in_tx.take();
+    }
+
+    fn result(&self) -> &[u8] {
+        &self.result
+    }
+}
+
+impl Drop for HwrP3Stream {
+    fn drop(&mut self) {
+        // Close inbound so the driver's await unblocks and the run unwinds.
+        self.in_tx.take();
+        // Drain any buffered outbound events so the worker's sync sends don't
+        // wedge, then join.
+        while self.rx.try_recv().is_ok() {}
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Block until the next streaming event: an outbound chunk, end-of-outbound, or
+/// completion. Returns [HWR_P3S_OUT] / [HWR_P3S_OUT_END] / [HWR_P3S_DONE] /
+/// [HWR_P3S_ERROR].
+///
+/// # Safety
+/// `session` must be a live pointer from a streaming-start entrypoint.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3s_poll(session: *mut HwrP3Stream) -> i32 {
+    if session.is_null() {
+        return HWR_P3S_ERROR;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (*session).poll()))
+        .unwrap_or(HWR_P3S_ERROR)
+}
+
+/// Pointer to the current outbound chunk (valid after [HWR_P3S_OUT] until the
+/// next poll). Use with [hwr_p3s_out_len].
+///
+/// # Safety
+/// `session` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3s_out_ptr(session: *mut HwrP3Stream) -> *const u8 {
+    if session.is_null() {
+        return std::ptr::null();
+    }
+    (*session).out_chunk().as_ptr()
+}
+
+/// Length of the current outbound chunk.
+///
+/// # Safety
+/// `session` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3s_out_len(session: *mut HwrP3Stream) -> usize {
+    if session.is_null() {
+        return 0;
+    }
+    (*session).out_chunk().len()
+}
+
+/// Push an inbound chunk (part of the response body) to the driver.
+///
+/// # Safety
+/// `session` must be live; `chunk` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3s_push(session: *mut HwrP3Stream, chunk: *const u8, len: usize) {
+    if session.is_null() {
+        return;
+    }
+    let bytes = if chunk.is_null() {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(chunk, len).to_vec()
+    };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (*session).push(bytes)));
+}
+
+/// Close the inbound stream (no more response chunks).
+///
+/// # Safety
+/// `session` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3s_push_end(session: *mut HwrP3Stream) {
+    if session.is_null() {
+        return;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (*session).push_end()));
+}
+
+/// Pointer to the final result bytes (after [HWR_P3S_DONE]; a UTF-8 message
+/// after [HWR_P3S_ERROR]). Use with [hwr_p3s_result_len].
+///
+/// # Safety
+/// `session` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3s_result_ptr(session: *mut HwrP3Stream) -> *const u8 {
+    if session.is_null() {
+        return std::ptr::null();
+    }
+    (*session).result().as_ptr()
+}
+
+/// Length of the final result bytes.
+///
+/// # Safety
+/// `session` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3s_result_len(session: *mut HwrP3Stream) -> usize {
+    if session.is_null() {
+        return 0;
+    }
+    (*session).result().len()
+}
+
+/// Free a streaming session, closing inbound and joining the worker.
+///
+/// # Safety
+/// `session` must be a pointer from a streaming-start entrypoint, not freed.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3s_free(session: *mut HwrP3Stream) {
+    if !session.is_null() {
+        drop(Box::from_raw(session));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1225,6 +1478,50 @@ mod tests {
         let mut s = p3_run_session(engine, component, b"x".to_vec());
         assert_eq!(s.poll(), HWR_P3_PENDING);
         drop(s); // must not hang — Drop cancels the oneshot and joins the worker
+    }
+
+    // P3 v2 streaming transport (stage 2). Synthetic driver: emit two outbound
+    // "request" chunks, then concatenate the inbound "response" chunks. Proves
+    // the framed bidirectional exchange end to end. Runtime-only (no wasmtime),
+    // so it runs in every build incl. --no-default-features (iOS).
+    fn p3s_echo_driver(
+        out: P3sOut,
+        mut in_rx: P3sIn,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> {
+        use futures_util::StreamExt;
+        async move {
+            out.chunk(b"req-1".to_vec());
+            out.chunk(b"req-2".to_vec());
+            out.end();
+            let mut acc = Vec::new();
+            while let Some(chunk) = in_rx.next().await {
+                acc.extend_from_slice(&chunk);
+            }
+            Ok(acc)
+        }
+    }
+
+    #[test]
+    fn p3s_streaming_roundtrip() {
+        let mut s = p3s_run_session(p3s_echo_driver);
+        assert_eq!(s.poll(), HWR_P3S_OUT);
+        assert_eq!(s.out_chunk(), b"req-1");
+        assert_eq!(s.poll(), HWR_P3S_OUT);
+        assert_eq!(s.out_chunk(), b"req-2");
+        assert_eq!(s.poll(), HWR_P3S_OUT_END); // request fully emitted
+        s.push(b"resp-A".to_vec()); // caller streams the response in
+        s.push(b"resp-B".to_vec());
+        s.push_end();
+        assert_eq!(s.poll(), HWR_P3S_DONE);
+        assert_eq!(s.result(), b"resp-Aresp-B");
+    }
+
+    #[test]
+    fn p3s_free_mid_stream() {
+        // Drop after draining one outbound chunk — must not hang.
+        let mut s = p3s_run_session(p3s_echo_driver);
+        assert_eq!(s.poll(), HWR_P3S_OUT);
+        drop(s);
     }
 
     #[cfg(feature = "compile")]
