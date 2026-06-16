@@ -86,3 +86,97 @@ fn pulley_http_handle_echo() {
     // The no-JIT iOS backend runs the concurrent wasi:http host too.
     assert_echo(true);
 }
+
+// ─── STAGE 4: handle routed through the P3 v2 transport ──────────────────────
+//
+// Instead of the synthetic in-process response, drive the guest's `handle`
+// through `hwr_p3s_start_http`: the runtime frames the request OUT (we act as
+// the caller/servicer, draining it), we push a framed response back IN, and the
+// guest's returned bytes reflect that response (status 200 + body).
+
+use hellohq_wasm_runtime::{
+    hwr_p3s_free, hwr_p3s_out_len, hwr_p3s_out_ptr, hwr_p3s_poll, hwr_p3s_push, hwr_p3s_push_end,
+    hwr_p3s_result_len, hwr_p3s_result_ptr, hwr_p3s_start_http, HWR_P3S_DONE, HWR_P3S_OUT,
+    HWR_P3S_OUT_END,
+};
+
+/// Drive the full transport round-trip: start the http session over the P3 v2
+/// transport, act as the servicer (drain the request, push a 200 response), and
+/// return the guest's run result bytes.
+fn run_via_transport(use_pulley: bool) -> Vec<u8> {
+    unsafe {
+        let session = hwr_p3s_start_http(use_pulley as i32, GUEST_WASM.as_ptr(), GUEST_WASM.len());
+        assert!(!session.is_null(), "start failed (use_pulley={use_pulley})");
+
+        // (1) Drain the outbound request frames until OUT_END; the head must name
+        //     the GET request the guest built.
+        let mut req_head = Vec::new();
+        loop {
+            match hwr_p3s_poll(session) {
+                HWR_P3S_OUT => {
+                    let ptr = hwr_p3s_out_ptr(session);
+                    let len = hwr_p3s_out_len(session);
+                    req_head.extend_from_slice(std::slice::from_raw_parts(ptr, len));
+                }
+                HWR_P3S_OUT_END => break,
+                other => {
+                    panic!("unexpected status while draining: {other} (use_pulley={use_pulley})")
+                }
+            }
+        }
+        let head_str = String::from_utf8_lossy(&req_head);
+        // Wire framing: "{METHOD} {scheme}://{authority}{path}" → here
+        // "GET https://example.com/". Half B must match this exact shape.
+        assert!(
+            head_str.starts_with("GET ") && head_str.contains("example.com/"),
+            "request head missing GET line: {head_str:?} (use_pulley={use_pulley})"
+        );
+
+        // (2) Push the framed response back IN: head ("{status}\n{header}") then
+        //     a body chunk, then close inbound.
+        let resp_head = b"200\nx-test: yes";
+        hwr_p3s_push(session, resp_head.as_ptr(), resp_head.len());
+        let body = b"hello-from-servicer";
+        hwr_p3s_push(session, body.as_ptr(), body.len());
+        hwr_p3s_push_end(session);
+
+        // (3) Poll to DONE and read the run result.
+        assert_eq!(
+            hwr_p3s_poll(session),
+            HWR_P3S_DONE,
+            "expected DONE (use_pulley={use_pulley})"
+        );
+        let rptr = hwr_p3s_result_ptr(session);
+        let rlen = hwr_p3s_result_len(session);
+        let result = std::slice::from_raw_parts(rptr, rlen).to_vec();
+        hwr_p3s_free(session);
+        result
+    }
+}
+
+/// Assert the guest's run result reflects the servicer's 200 response: a LE u16
+/// status prefix of 200 followed by the body the servicer streamed in.
+fn assert_transport(use_pulley: bool) {
+    let out = run_via_transport(use_pulley);
+    assert!(
+        out.len() >= 2,
+        "missing status prefix (use_pulley={use_pulley})"
+    );
+    let status = u16::from_le_bytes([out[0], out[1]]);
+    assert_eq!(status, 200, "status (use_pulley={use_pulley})");
+    let body = String::from_utf8_lossy(&out[2..]);
+    assert_eq!(
+        body, "hello-from-servicer",
+        "transport body (use_pulley={use_pulley})"
+    );
+}
+
+#[test]
+fn cranelift_http_handle_via_transport() {
+    assert_transport(false);
+}
+
+#[test]
+fn pulley_http_handle_via_transport() {
+    assert_transport(true);
+}

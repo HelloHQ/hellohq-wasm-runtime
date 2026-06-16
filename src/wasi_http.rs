@@ -277,20 +277,49 @@ impl<T> Table<T> {
     }
 }
 
+/// STAGE 4 transport: the P3 v2 streaming channel pair the `handle` driver uses
+/// to round-trip the request/response with the caller (Dart). `out` carries the
+/// request head (and, later, request body) OUT to the caller; `inbound` is the
+/// caller's response stream — taken (`Option::take`) and awaited by `handle`
+/// OUTSIDE any `accessor.with` borrow. Absent (`transport: None`) on the
+/// in-process synthetic path that `tests/http_handle.rs` exercises.
+pub(crate) struct HttpTransport {
+    pub(crate) out: crate::P3sOut,
+    pub(crate) inbound: Option<crate::P3sIn>,
+}
+
 /// In-memory host state implementing the `wasi:http@0.3-rc` host traits. Holds a
-/// resource table per resource kind, each keyed by `Resource::rep()`.
-#[derive(Debug, Default)]
+/// resource table per resource kind, each keyed by `Resource::rep()`. STAGE 4
+/// optionally carries a [`HttpTransport`]: when `Some`, `handler::handle` routes
+/// through the P3 v2 transport (a gated fetch the caller services); when `None`,
+/// it keeps synthesizing the in-process echo response.
+#[derive(Default)]
 pub struct WasiHttpHost {
     fields: Table<FieldsData>,
     requests: Table<RequestData>,
     responses: Table<ResponseData>,
     options: Table<RequestOptionsData>,
+    /// STAGE 4 P3 transport; `None` on the synthetic in-process path.
+    pub(crate) transport: Option<HttpTransport>,
 }
 
 impl WasiHttpHost {
-    /// Construct an empty host.
+    /// Construct an empty host (synthetic in-process path, `transport: None`).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// STAGE 4: construct a host wired to a P3 v2 streaming transport, so
+    /// `handler::handle` routes the request OUT to the caller and builds the
+    /// response from the caller's inbound frames.
+    pub(crate) fn with_transport(out: crate::P3sOut, inbound: crate::P3sIn) -> Self {
+        WasiHttpHost {
+            transport: Some(HttpTransport {
+                out,
+                inbound: Some(inbound),
+            }),
+            ..Default::default()
+        }
     }
 
     /// Register every `wasi:http@0.3-rc` import (clocks types, http types, http
@@ -891,10 +920,17 @@ impl wasi::http::handler::HostWithStore for wasmtime::component::HasSelf<WasiHtt
         accessor: &wasmtime::component::Accessor<T, Self>,
         request: wasmtime::component::Resource<Request>,
     ) -> Result<wasmtime::component::Resource<Response>, ErrorCode> {
-        // STAGE 3: synthesize the response IN-PROCESS (no network, no P3 yet).
-        // We read the request's metadata + headers from the host resource state
-        // and echo a one-line summary back as the 200 response body. STAGE 4
-        // replaces this synthetic response with a real P3 round-trip to Dart.
+        // STAGE 4: when a P3 transport is present, route the request OUT to the
+        // caller (Dart's gated fetch) and build the response from what the caller
+        // streams back IN. When `transport` is `None` we keep the STAGE-3
+        // in-process synthetic echo (so `tests/http_handle.rs` is unaffected).
+        let has_transport = accessor.with(|mut access| access.get().transport.is_some());
+        if has_transport {
+            return handle_via_transport(accessor, request).await;
+        }
+
+        // STAGE 3 synthetic path: read the request's metadata + headers from the
+        // host resource state and echo a one-line summary back as the 200 body.
         accessor.with(|mut access| {
             let host = access.get();
 
@@ -945,6 +981,139 @@ impl wasi::http::handler::HostWithStore for wasmtime::component::HasSelf<WasiHtt
             Ok(wasmtime::component::Resource::<Response>::new_own(rep))
         })
     }
+}
+
+/// STAGE 4 transport path for `handle`. Frames the request OUT to the caller
+/// over `transport.out`, awaits the caller's framed response on the inbound
+/// receiver, and builds the `Response` resource from it.
+///
+/// Borrow discipline: every `accessor.with` closure pulls owned values out
+/// (cloned metadata, the `take`-n inbound receiver, minted streams) and returns
+/// before any `.await`. The inbound receiver is awaited LOCALLY, outside `with`,
+/// so no `Access`/store borrow is held across the await.
+async fn handle_via_transport<T: Send>(
+    accessor: &wasmtime::component::Accessor<T, wasmtime::component::HasSelf<WasiHttpHost>>,
+    request: wasmtime::component::Resource<Request>,
+) -> Result<wasmtime::component::Resource<Response>, ErrorCode> {
+    // (1) Read request metadata + headers, build the head bytes, emit the
+    //     request OUT, and take the inbound receiver — all inside one `with`,
+    //     dropping the borrow before we await.
+    let inbound = accessor.with(|mut access| {
+        let host = access.get();
+        let Some(req) = host.requests.get(request.rep()) else {
+            return Err(ErrorCode::InternalError(Some(
+                "wasi:http handler: unknown request resource".to_string(),
+            )));
+        };
+        let method = method_str(&req.method).to_string();
+        let scheme = match req.scheme.as_ref() {
+            Some(SchemeOwned::Http) => "http",
+            Some(SchemeOwned::Https) => "https",
+            Some(SchemeOwned::Other(s)) => s.as_str(),
+            None => "https",
+        }
+        .to_string();
+        let authority = req.authority.clone().unwrap_or_default();
+        let path = req
+            .path_with_query
+            .clone()
+            .unwrap_or_else(|| "/".to_string());
+        let header_entries = host
+            .fields
+            .get(req.headers)
+            .map(|f| f.entries.clone())
+            .unwrap_or_default();
+
+        // Frame 1 = head: "{METHOD} {scheme}://{authority}{path}" then one
+        // "{name}: {value}" line per header, '\n'-separated.
+        let mut head = format!("{method} {scheme}://{authority}{path}");
+        for (name, value) in &header_entries {
+            head.push('\n');
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(&String::from_utf8_lossy(value));
+        }
+
+        let host = access.get();
+        let Some(transport) = host.transport.as_mut() else {
+            return Err(ErrorCode::InternalError(Some(
+                "wasi:http handler: transport missing".to_string(),
+            )));
+        };
+        transport.out.chunk(head.into_bytes());
+        transport.out.end();
+        // Take the inbound receiver out so we can await it without the borrow.
+        let inbound = transport.inbound.take();
+        Ok(inbound)
+    })?;
+
+    let Some(mut inbound) = inbound else {
+        return Err(ErrorCode::InternalError(Some(
+            "wasi:http handler: inbound stream already consumed".to_string(),
+        )));
+    };
+
+    // (2) Await the caller's response OUTSIDE `with`. Frame 1 = head
+    //     ("{status}\n{name}: {value}..."); subsequent frames = raw body
+    //     bytes, accumulated until the stream yields `None`.
+    use futures_util::StreamExt;
+    let Some(head_frame) = inbound.next().await else {
+        return Err(ErrorCode::InternalError(Some(
+            "wasi:http handler: caller closed inbound before sending a head".to_string(),
+        )));
+    };
+    let head = String::from_utf8_lossy(&head_frame);
+    let mut lines = head.split('\n');
+    let status_line = lines.next().unwrap_or("");
+    let status_code: StatusCode = status_line.trim().parse().map_err(|_| {
+        ErrorCode::InternalError(Some(format!(
+            "wasi:http handler: malformed response status line {status_line:?}"
+        )))
+    })?;
+    let mut resp_header_entries: Vec<(String, Vec<u8>)> = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            resp_header_entries.push((
+                name.trim().to_string(),
+                value.trim_start().as_bytes().to_vec(),
+            ));
+        }
+    }
+
+    let mut body_bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = inbound.next().await {
+        body_bytes.extend_from_slice(&chunk);
+    }
+
+    // (3) Build the `Response` resource (status + headers + body stream) in a
+    //     fresh `with`, minting the body stream + a ready `Ok(None)` trailers
+    //     future, and return it.
+    accessor.with(|mut access| {
+        let host = access.get();
+        let headers_rep = host.fields.insert(FieldsData {
+            entries: resp_header_entries,
+            immutable: false,
+        });
+
+        let body = wasmtime::component::StreamReader::new(&mut access, body_bytes)
+            .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))?;
+        let trailers: TrailersFuture = wasmtime::component::FutureReader::new(&mut access, async {
+            Ok::<_, wasmtime::Error>(Ok::<_, ErrorCode>(None))
+        })
+        .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))?;
+
+        let host = access.get();
+        let rep = host.responses.insert(ResponseData {
+            status_code,
+            headers: headers_rep,
+            body: Some(body),
+            trailers: Some(trailers),
+        });
+        Ok(wasmtime::component::Resource::<Response>::new_own(rep))
+    })
 }
 
 /// Stable string form of a `MethodOwned` for the echo summary.
