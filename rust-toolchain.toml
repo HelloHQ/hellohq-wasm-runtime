@@ -1,0 +1,26 @@
+# Pinned Rust toolchain. DO NOT bump without re-verifying the iOS slice.
+#
+# WHY PINNED: rustc 1.96.0 regressed fat-LTO (`[profile.release] lto = true`)
+# symbol export for `staticlib` crates — it internalizes and dead-strips the
+# `#[no_mangle]` `hwr_*` C-ABI exports. The iOS xcframework is the only
+# staticlib consumer (Pulley, no-JIT); on 1.96.0 it shipped with ZERO callable
+# symbols (not even hwr_self_test), while the cdylib platforms
+# (macOS/Linux/Windows/Android) were unaffected because a cdylib carries an
+# explicit export list a `.a` does not.
+#
+# 1.93.1 retains all 38 exports with full fat-LTO (verified via `nm` on the
+# device .a). Neither `strip` nor a `#[used]` keep-alive fixes 1.96.0 (the
+# symbol is internalized before strip; #[used] keeps the code but not the
+# external name); `lto = false` works but emits LLVM-bitcode objects Apple's
+# linker can't read. So we pin instead.
+#
+# Before bumping: build `--no-default-features --features wasi-http --target
+# aarch64-apple-ios` and confirm `nm` lists hwr_self_test + the
+# hwr_p3s_start_*_precompiled exports in the resulting libhellohq_wasm_runtime.a.
+[toolchain]
+channel = "1.93.1"
+profile = "minimal"
+# rustfmt + clippy for the CI lint job (rustup won't auto-install components the
+# way it auto-installs toolchains/targets named here). Targets are added by the
+# per-runner `rustup target add` steps, which resolve to this pinned toolchain.
+components = ["rustfmt", "clippy"]

@@ -79,13 +79,14 @@ required-features = ["ios-bench"]
 [profile.release]
 opt-level = "z"
 lto = true
-# strip = "debuginfo", NOT "symbols"/true: the iOS slice ships as a `staticlib`
-# (.a), which has no dynamic-symbol table. Full strip would delete the symbol
-# table outright — including the #[no_mangle] `hwr_*` FFI exports — leaving the
-# xcframework with zero callable symbols (cdylibs survive a full strip because
-# their exports live in .dynsym, but a .a does not). "debuginfo" drops the bulk
-# (debug info) while keeping the symbol table; the final app link still
-# dead-strips unreachable code, so on-device size is unaffected.
-strip = "debuginfo"
+strip = true
 # panic = unwind (default) so the FFI entrypoints' catch_unwind converts any
 # panic into an error return instead of unwinding across the C boundary.
+#
+# NOTE: the Rust toolchain is pinned in rust-toolchain.toml. rustc 1.96.0
+# regressed fat-LTO symbol export for `staticlib` crates: the #[no_mangle]
+# `hwr_*` FFI exports get internalized and dead-stripped, so the iOS xcframework
+# (the only staticlib consumer) ships with zero callable symbols. cdylibs
+# (macOS/Linux/Windows/Android) are unaffected — they carry an explicit export
+# list. The pin keeps us on a toolchain that retains the exports; do NOT bump it
+# without re-verifying `nm` shows hwr_* in the iOS .a (see tests + CI).
