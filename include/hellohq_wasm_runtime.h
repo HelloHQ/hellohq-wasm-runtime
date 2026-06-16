@@ -92,6 +92,19 @@ void           hwr_p3s_free(HwrP3Stream*);             /* [no-JIT] closes inboun
  * (Dart) services it (gated) and pushes the response IN. (wasi-http feature.) */
 HwrP3Stream* hwr_p3s_start_http(int32_t use_pulley, const uint8_t* component,
                                 size_t component_len);                          /* [compile,wasi-http] */
+/* Run the hellohq:plugin/inference guest by COMPILING [component] (Cranelift). */
+HwrP3Stream* hwr_p3s_start_inference(int32_t use_pulley, const uint8_t* component,
+                                     size_t component_len);                     /* [compile,wasi-http] */
+
+/* ── No-JIT streaming (iOS): DESERIALIZE a precompiled pulley64 artifact ──── */
+/* No-Cranelift twins of the above: deserialize a precompiled (pulley64) artifact
+ * (from hwr_precompile_component) and run it over the P3 v2 transport. These ship
+ * in the iOS no-JIT slice (wasi-http feature only). */
+HwrP3Stream* hwr_p3s_start_http_precompiled(int32_t use_pulley, const uint8_t* component,
+                                            size_t component_len);              /* [wasi-http] */
+HwrP3Stream* hwr_p3s_start_inference_precompiled(int32_t use_pulley, const uint8_t* component,
+                                                 size_t component_len);         /* [wasi-http] */
+
 /* Start a P3 run by COMPILING a raw component (desktop/Android; host tests). */
 HwrP3Session* hwr_p3_start_compile(int32_t use_pulley, const uint8_t* component, size_t component_len,
                                    const uint8_t* input, size_t input_len);  /* [compile] */

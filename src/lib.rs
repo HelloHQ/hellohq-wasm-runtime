@@ -1292,17 +1292,91 @@ pub unsafe extern "C" fn hwr_p3s_result_len(session: *mut HwrP3Stream) -> usize 
     (*session).result().len()
 }
 
-/// STAGE 4: start a streaming session that runs the `wasi:http` guest over the
-/// P3 v2 transport. Builds a concurrency-enabled engine (async + optionally the
-/// Pulley backend), compiles `component`, and runs `p3s_run_session` with a
-/// driver that instantiates the guest with a [`WasiHttpHost`] whose transport is
-/// wired to the streaming channel. The guest's `handler.handle` then frames the
-/// request OUT (drained via [hwr_p3s_poll]/[hwr_p3s_out_ptr]) and builds the
-/// response from the caller's pushed-IN frames ([hwr_p3s_push]/[hwr_p3s_push_end]).
-/// The run result is the guest's returned `list<u8>` (status prefix + body).
+// ── P3 v2 streaming: shared engine + session runners ─────────────────────────
+//
+// The engine config and the per-transport driver are identical whether the
+// component is freshly compiled (Cranelift, `Component::new`) or deserialized
+// from a precompiled pulley64 artifact (`Component::deserialize`, no Cranelift).
+// Factor them out so the `compile` and no-JIT (`_precompiled`) entrypoints share
+// one body and differ only in how they obtain the `Component`.
+
+/// Build the concurrency-enabled engine the streaming transports need (component
+/// model + async + concurrency, to mint streams/futures), optionally targeting
+/// the Pulley interpreter. Returns None on misconfiguration.
+#[cfg(feature = "wasi-http")]
+fn p3s_engine(use_pulley: bool) -> Option<wasmtime::Engine> {
+    let mut cfg = wasmtime::Config::new();
+    cfg.wasm_component_model(true);
+    cfg.wasm_component_model_async(true);
+    cfg.concurrency_support(true);
+    if use_pulley && cfg.target("pulley64").is_err() {
+        return None;
+    }
+    wasmtime::Engine::new(&cfg).ok()
+}
+
+/// Run the `wasi:http` guest [component] on [engine] over the P3 v2 transport.
+#[cfg(feature = "wasi-http")]
+fn p3s_http_session(
+    engine: wasmtime::Engine,
+    component: wasmtime::component::Component,
+) -> *mut HwrP3Stream {
+    let session = p3s_run_session(move |out, in_rx| async move {
+        let e2s = |e: wasmtime::Error| e.to_string();
+        let mut linker =
+            wasmtime::component::Linker::<crate::wasi_http::WasiHttpHost>::new(&engine);
+        crate::wasi_http::WasiHttpHost::add_to_linker(&mut linker).map_err(e2s)?;
+
+        let host = crate::wasi_http::WasiHttpHost::with_transport(out, in_rx);
+        let mut store = wasmtime::Store::new(&engine, host);
+        let instance = linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .map_err(e2s)?;
+        let run = instance
+            .get_typed_func::<(), (Vec<u8>,)>(&mut store, "run")
+            .map_err(e2s)?;
+        let (output,) = run.call_async(&mut store, ()).await.map_err(e2s)?;
+        Ok(output)
+    });
+    Box::into_raw(Box::new(session))
+}
+
+/// Run the `hellohq:plugin/inference` guest [component] on [engine] over P3 v2.
+#[cfg(feature = "wasi-http")]
+fn p3s_inference_session(
+    engine: wasmtime::Engine,
+    component: wasmtime::component::Component,
+) -> *mut HwrP3Stream {
+    let session = p3s_run_session(move |out, in_rx| async move {
+        let e2s = |e: wasmtime::Error| e.to_string();
+        let mut linker =
+            wasmtime::component::Linker::<crate::inference::InferenceHost>::new(&engine);
+        crate::inference::InferenceHost::add_to_linker(&mut linker).map_err(e2s)?;
+
+        let host = crate::inference::InferenceHost::with_transport(out, in_rx);
+        let mut store = wasmtime::Store::new(&engine, host);
+        let instance = linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .map_err(e2s)?;
+        let run = instance
+            .get_typed_func::<(), (Vec<u8>,)>(&mut store, "run")
+            .map_err(e2s)?;
+        let (output,) = run.call_async(&mut store, ()).await.map_err(e2s)?;
+        Ok(output)
+    });
+    Box::into_raw(Box::new(session))
+}
+
+/// STAGE 4: start a streaming `wasi:http` session by COMPILING `component`
+/// (Cranelift). The guest's `handler.handle` frames the request OUT (drained via
+/// [hwr_p3s_poll]/[hwr_p3s_out_ptr]) and builds the response from pushed-IN
+/// frames ([hwr_p3s_push]/[hwr_p3s_push_end]); the run result is the guest's
+/// `list<u8>` (status prefix + body).
 ///
-/// Gated on `compile` (needs Cranelift for `Component::new`) like
-/// [hwr_p3_start_compile].
+/// Gated on `compile` (Cranelift). For the no-JIT (iOS) path use
+/// [hwr_p3s_start_http_precompiled].
 ///
 /// # Safety
 /// `component` must point to `component_len` readable bytes.
@@ -1318,62 +1392,61 @@ pub unsafe extern "C" fn hwr_p3s_start_http(
             return std::ptr::null_mut();
         }
         let comp_bytes = std::slice::from_raw_parts(component, component_len).to_vec();
-        let use_pulley = use_pulley != 0;
-
-        // Engine: component model + async + concurrency support (to mint
-        // streams/futures), matching tests/http_handle.rs's engine builder.
-        let mut cfg = wasmtime::Config::new();
-        cfg.wasm_component_model(true);
-        cfg.wasm_component_model_async(true);
-        cfg.concurrency_support(true);
-        if use_pulley && cfg.target("pulley64").is_err() {
-            return std::ptr::null_mut();
-        }
-        let engine = match wasmtime::Engine::new(&cfg) {
-            Ok(e) => e,
-            Err(_) => return std::ptr::null_mut(),
+        let engine = match p3s_engine(use_pulley != 0) {
+            Some(e) => e,
+            None => return std::ptr::null_mut(),
         };
         let component = match wasmtime::component::Component::new(&engine, &comp_bytes) {
             Ok(c) => c,
             Err(_) => return std::ptr::null_mut(),
         };
-
-        let session = p3s_run_session(move |out, in_rx| async move {
-            let e2s = |e: wasmtime::Error| e.to_string();
-            let mut linker =
-                wasmtime::component::Linker::<crate::wasi_http::WasiHttpHost>::new(&engine);
-            crate::wasi_http::WasiHttpHost::add_to_linker(&mut linker).map_err(e2s)?;
-
-            let host = crate::wasi_http::WasiHttpHost::with_transport(out, in_rx);
-            let mut store = wasmtime::Store::new(&engine, host);
-            let instance = linker
-                .instantiate_async(&mut store, &component)
-                .await
-                .map_err(e2s)?;
-            let run = instance
-                .get_typed_func::<(), (Vec<u8>,)>(&mut store, "run")
-                .map_err(e2s)?;
-            let (output,) = run.call_async(&mut store, ()).await.map_err(e2s)?;
-            Ok(output)
-        });
-        Box::into_raw(Box::new(session))
+        p3s_http_session(engine, component)
     })
     .unwrap_or(std::ptr::null_mut())
 }
 
-/// Start a streaming session that runs the `hellohq:plugin/inference` guest over
-/// the P3 v2 transport — the async-first AI inference round-trip. Builds a
-/// concurrency-enabled engine (async + optionally Pulley), compiles `component`,
-/// and runs `p3s_run_session` with a driver that instantiates the guest with an
-/// [`inference::InferenceHost`] whose transport is wired to the streaming
-/// channel. The guest's `inference.complete` then frames the request head OUT
-/// (drained via [hwr_p3s_poll]/[hwr_p3s_out_ptr]) and builds the returned
-/// `stream<string>` from the caller's pushed-IN token-delta frames
-/// ([hwr_p3s_push]/[hwr_p3s_push_end]). The run result is the guest's returned
-/// `list<u8>` (the concatenated token deltas).
+/// No-JIT twin of [hwr_p3s_start_http]: DESERIALIZE a precompiled (pulley64)
+/// component artifact instead of compiling it, so the streaming `wasi:http` path
+/// runs on the iOS Pulley build (no Cranelift). Gated on `wasi-http` only.
 ///
-/// Mirrors [hwr_p3s_start_http]. Gated on `compile` (needs Cranelift for
-/// `Component::new`).
+/// # Safety
+/// `component` must point to `component_len` readable bytes that are a trusted
+/// artifact produced by [hwr_precompile_component] for this runtime version;
+/// `Component::deserialize` does not validate untrusted input.
+#[cfg(feature = "wasi-http")]
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3s_start_http_precompiled(
+    use_pulley: i32,
+    component: *const u8,
+    component_len: usize,
+) -> *mut HwrP3Stream {
+    std::panic::catch_unwind(|| {
+        if component.is_null() {
+            return std::ptr::null_mut();
+        }
+        let comp_bytes = std::slice::from_raw_parts(component, component_len).to_vec();
+        let engine = match p3s_engine(use_pulley != 0) {
+            Some(e) => e,
+            None => return std::ptr::null_mut(),
+        };
+        let component =
+            match unsafe { wasmtime::component::Component::deserialize(&engine, &comp_bytes) } {
+                Ok(c) => c,
+                Err(_) => return std::ptr::null_mut(),
+            };
+        p3s_http_session(engine, component)
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Start a streaming `hellohq:plugin/inference` session by COMPILING `component`
+/// (Cranelift) — the async-first AI inference round-trip. The guest's
+/// `inference.complete` frames the request head OUT and builds the returned
+/// `stream<string>` from pushed-IN token-delta frames; the run result is the
+/// concatenated token deltas.
+///
+/// Gated on `compile` (Cranelift). For the no-JIT (iOS) path use
+/// [hwr_p3s_start_inference_precompiled].
 ///
 /// # Safety
 /// `component` must point to `component_len` readable bytes.
@@ -1389,45 +1462,49 @@ pub unsafe extern "C" fn hwr_p3s_start_inference(
             return std::ptr::null_mut();
         }
         let comp_bytes = std::slice::from_raw_parts(component, component_len).to_vec();
-        let use_pulley = use_pulley != 0;
-
-        // Engine: component model + async + concurrency support (to mint the
-        // token stream), matching hwr_p3s_start_http's engine builder.
-        let mut cfg = wasmtime::Config::new();
-        cfg.wasm_component_model(true);
-        cfg.wasm_component_model_async(true);
-        cfg.concurrency_support(true);
-        if use_pulley && cfg.target("pulley64").is_err() {
-            return std::ptr::null_mut();
-        }
-        let engine = match wasmtime::Engine::new(&cfg) {
-            Ok(e) => e,
-            Err(_) => return std::ptr::null_mut(),
+        let engine = match p3s_engine(use_pulley != 0) {
+            Some(e) => e,
+            None => return std::ptr::null_mut(),
         };
         let component = match wasmtime::component::Component::new(&engine, &comp_bytes) {
             Ok(c) => c,
             Err(_) => return std::ptr::null_mut(),
         };
+        p3s_inference_session(engine, component)
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
 
-        let session = p3s_run_session(move |out, in_rx| async move {
-            let e2s = |e: wasmtime::Error| e.to_string();
-            let mut linker =
-                wasmtime::component::Linker::<crate::inference::InferenceHost>::new(&engine);
-            crate::inference::InferenceHost::add_to_linker(&mut linker).map_err(e2s)?;
-
-            let host = crate::inference::InferenceHost::with_transport(out, in_rx);
-            let mut store = wasmtime::Store::new(&engine, host);
-            let instance = linker
-                .instantiate_async(&mut store, &component)
-                .await
-                .map_err(e2s)?;
-            let run = instance
-                .get_typed_func::<(), (Vec<u8>,)>(&mut store, "run")
-                .map_err(e2s)?;
-            let (output,) = run.call_async(&mut store, ()).await.map_err(e2s)?;
-            Ok(output)
-        });
-        Box::into_raw(Box::new(session))
+/// No-JIT twin of [hwr_p3s_start_inference]: DESERIALIZE a precompiled (pulley64)
+/// component artifact so the streaming inference path runs on the iOS Pulley
+/// build (no Cranelift). Gated on `wasi-http` only.
+///
+/// # Safety
+/// `component` must point to `component_len` readable bytes that are a trusted
+/// artifact produced by [hwr_precompile_component]; `Component::deserialize`
+/// does not validate untrusted input.
+#[cfg(feature = "wasi-http")]
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3s_start_inference_precompiled(
+    use_pulley: i32,
+    component: *const u8,
+    component_len: usize,
+) -> *mut HwrP3Stream {
+    std::panic::catch_unwind(|| {
+        if component.is_null() {
+            return std::ptr::null_mut();
+        }
+        let comp_bytes = std::slice::from_raw_parts(component, component_len).to_vec();
+        let engine = match p3s_engine(use_pulley != 0) {
+            Some(e) => e,
+            None => return std::ptr::null_mut(),
+        };
+        let component =
+            match unsafe { wasmtime::component::Component::deserialize(&engine, &comp_bytes) } {
+                Ok(c) => c,
+                Err(_) => return std::ptr::null_mut(),
+            };
+        p3s_inference_session(engine, component)
     })
     .unwrap_or(std::ptr::null_mut())
 }

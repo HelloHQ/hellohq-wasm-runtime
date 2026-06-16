@@ -38,12 +38,19 @@ jobs:
       - name: Unit + integration tests (default features)
         run: cargo test --all-targets --locked
 
-      # iOS no-JIT path: build runtime + Pulley only (no Cranelift / wat). Scoped
-      # to --lib --tests because the examples are desktop tooling that needs the
-      # compiler (Module::new / precompile). The compile-gated tests compile out;
-      # the rest must still pass, proving the shipped iOS library links + its ABI.
-      - name: No-JIT build + tests (--no-default-features)
-        run: cargo test --no-default-features --lib --tests --locked
+      # wasi-http: the streaming network:fetch / ai:inference host impls + their
+      # entrypoints (incl. the precompiled-streaming round-trip) only compile +
+      # run under this feature. Covers tests/{http_handle,inference_complete,
+      # storage_events,streaming_precompiled}.rs.
+      - name: Streaming tests (--features wasi-http)
+        run: cargo test --features wasi-http --all-targets --locked
+
+      # iOS no-JIT path: runtime + Pulley only (no Cranelift / wat), WITH wasi-http
+      # so the shipped iOS library links the no-Cranelift streaming entrypoints
+      # (hwr_p3s_start_*_precompiled). Scoped to --lib --tests; compile-gated tests
+      # compile out, the rest prove the iOS library links + its ABI.
+      - name: No-JIT build + tests (--no-default-features --features wasi-http)
+        run: cargo test --no-default-features --features wasi-http --lib --tests --locked
 
   lint:
     name: fmt + clippy
@@ -67,13 +74,14 @@ jobs:
       # not built. Device + Apple-Silicon simulator cover everything we ship/run.
       - name: Add iOS targets (device + Apple-Silicon simulator)
         run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-      # The shipped iOS runtime is Pulley-only (no Cranelift), so each slice
-      # builds with --no-default-features. Compile + link only — no execution.
-      - name: Cross-build iOS slices (Pulley, no JIT)
+      # The shipped iOS runtime is Pulley-only (no Cranelift) + wasi-http (the
+      # no-Cranelift streaming entrypoints), matching build-release.sh's
+      # build_nojit. Compile + link only — no execution.
+      - name: Cross-build iOS slices (Pulley, no JIT, wasi-http)
         run: |
           for target in aarch64-apple-ios aarch64-apple-ios-sim; do
             echo "::group::$target"
-            cargo build --no-default-features --target "$target" --locked
+            cargo build --no-default-features --features wasi-http --target "$target" --locked
             echo "::endgroup::"
           done
 
@@ -89,7 +97,8 @@ jobs:
         run: cargo install cargo-ndk --locked
       - name: Resolve NDK path
         run: echo "ANDROID_NDK_HOME=${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}}" >> "$GITHUB_ENV"
-      # Mirrors build-release.sh: Android ships default features (Cranelift).
+      # Mirrors build-release.sh: Android ships Cranelift + wasi-http (so the
+      # streaming entrypoints the Dart loader resolves are present in the .so).
       # Compile + link the three ABIs only — no jniLibs staging, no execution.
-      - name: Cross-build jniLibs (default features / Cranelift)
-        run: cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 build --locked
+      - name: Cross-build jniLibs (Cranelift + wasi-http)
+        run: cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 build --features wasi-http --locked

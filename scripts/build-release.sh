@@ -75,8 +75,11 @@ build_jit() {
 
 # iOS: drop Cranelift. runtime + Pulley + component-model + async + std only.
 build_nojit() {
-  echo "→ cargo build --release --no-default-features --target $1  (Pulley, no JIT)"
-  cargo build --release --no-default-features --target "$1"
+  # --features wasi-http ships the no-Cranelift streaming entrypoints
+  # (hwr_p3s_start_{http,inference}_precompiled) so the iOS slice can run the
+  # network:fetch / ai:inference transports from precompiled pulley64 artifacts.
+  echo "→ cargo build --release --no-default-features --features wasi-http --target $1  (Pulley, no JIT)"
+  cargo build --release --no-default-features --features wasi-http --target "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -91,8 +94,8 @@ build_android() {
   if [ -z "${ANDROID_NDK_HOME:-}" ]; then
     echo "⚠ ANDROID_NDK_HOME unset; skipping Android"; return 0
   fi
-  echo "→ cargo ndk → jniLibs (arm64-v8a, armeabi-v7a, x86_64)  (default features / Cranelift)"
-  cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o "$STAGE/jniLibs" build --release
+  echo "→ cargo ndk → jniLibs (arm64-v8a, armeabi-v7a, x86_64)  (Cranelift + wasi-http)"
+  cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o "$STAGE/jniLibs" build --release --features wasi-http
   ( cd "$STAGE" && zip -qry jniLibs.zip jniLibs && rm -rf jniLibs )
 }
 
