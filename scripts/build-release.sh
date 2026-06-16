@@ -49,7 +49,17 @@ has_target() { rustup target list --installed 2>/dev/null | grep -qx "$1"; }
 # Zip a staged platform dir into <dir>.zip (preserving the dir prefix) so the
 # release asset basename is unique, then drop the unzipped dir.
 zip_platform_dir() {
-  ( cd "$STAGE" && zip -qry "$1.zip" "$1" && rm -rf "$1" )
+  ( cd "$STAGE"
+    # GitHub's Windows runners' Git-Bash has no `zip`; fall back to 7z (present on
+    # the runner) or PowerShell Compress-Archive. Linux/macOS use `zip`.
+    if command -v zip >/dev/null 2>&1; then
+      zip -qry "$1.zip" "$1"
+    elif command -v 7z >/dev/null 2>&1; then
+      7z a -tzip -bso0 -bsp0 "$1.zip" "$1" >/dev/null
+    else
+      powershell -NoProfile -Command "Compress-Archive -Path '$1' -DestinationPath '$1.zip' -Force"
+    fi
+    rm -rf "$1" )
 }
 
 # Desktop / Android: DEFAULT features → Cranelift JIT.
