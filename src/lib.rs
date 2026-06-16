@@ -39,6 +39,9 @@
 
 /// C ABI version. Bumped on any breaking change to the exported surface so the
 /// Dart `dart:ffi` loader can refuse a mismatched native library.
+#[cfg(feature = "wasi-http-probe")]
+mod wasi_http_probe;
+
 pub const HWR_ABI_VERSION: u32 = 1;
 
 // In-process Wasm compilation/execution requires Cranelift and is available only

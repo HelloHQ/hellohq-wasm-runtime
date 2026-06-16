@@ -51,6 +51,7 @@ compile = ["wasmtime/cranelift", "wasmtime/wat"]
 # include_bytes! (run `gen_bench_artifact` first). Kept behind a feature so the
 # default `cargo test`/`cargo build` never needs the generated file present.
 ios-bench = []
+wasi-http-probe = []
 
 # Examples gated by the features they need, so `cargo build --no-default-features
 # [--examples]` (the iOS no-JIT link check) never tries to compile a Cranelift-only

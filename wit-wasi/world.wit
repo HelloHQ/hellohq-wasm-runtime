@@ -1,0 +1,8 @@
+// Vendored wasi:http@0.3.0-rc world for the Option B outbound-HTTP host. The
+// plugin imports wasi:http/handler and calls handle(request) for outbound
+// fetches; the host implements handle, routed app-side (gated) via P3.
+package hellohq:http-probe;
+
+world http-probe {
+  import wasi:http/handler@0.3.0-rc-2026-01-06;
+}
