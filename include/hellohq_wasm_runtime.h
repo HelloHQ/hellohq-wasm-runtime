@@ -47,7 +47,30 @@ HwrInstance* hwr_instance_new_precompiled(HwrEngine* engine,
                                           size_t len);           /* [no-JIT] */
 void         hwr_free_bytes(uint8_t* ptr, size_t len);           /* [no-JIT] */
 
+/* ── P3: Dart-serviced host-call round-trip (step/poll bridge) ───────────── */
+/* A host import the guest calls suspends the run; the request surfaces via the
+ * blocking hwr_p3_poll; the caller services it (gated, app-side) and resolves
+ * the value; the run resumes. wasi:http + ai:inference ride this round-trip. */
+typedef struct HwrP3Session HwrP3Session;
+#define HWR_P3_PENDING 1 /* host call awaits a value: read request, then resolve */
+#define HWR_P3_DONE    2 /* run finished OK: read result                        */
+#define HWR_P3_ERROR   3 /* run errored: result holds a UTF-8 message           */
+
+/* Start a run from a PRECOMPILED component (deserialize) — the iOS path. */
+HwrP3Session* hwr_p3_start(int32_t use_pulley, const uint8_t* component, size_t component_len,
+                           const uint8_t* input, size_t input_len);          /* [no-JIT] */
+int32_t        hwr_p3_poll(HwrP3Session*);            /* [no-JIT] BLOCKS; HWR_P3_*       */
+const uint8_t* hwr_p3_request_ptr(HwrP3Session*);     /* [no-JIT] valid until resolve    */
+size_t         hwr_p3_request_len(HwrP3Session*);     /* [no-JIT] */
+void           hwr_p3_resolve(HwrP3Session*, const uint8_t* response, size_t response_len); /* [no-JIT] */
+const uint8_t* hwr_p3_result_ptr(HwrP3Session*);      /* [no-JIT] valid after DONE/ERROR */
+size_t         hwr_p3_result_len(HwrP3Session*);      /* [no-JIT] */
+void           hwr_p3_free(HwrP3Session*);            /* [no-JIT] cancels + joins        */
+
 /* ── Compile-time only (Cranelift); NOT in the iOS slice ─────────────────── */
+/* Start a P3 run by COMPILING a raw component (desktop/Android; host tests). */
+HwrP3Session* hwr_p3_start_compile(int32_t use_pulley, const uint8_t* component, size_t component_len,
+                                   const uint8_t* input, size_t input_len);  /* [compile] */
 int64_t      hwr_eval_add(int32_t use_pulley, int32_t a, int32_t b);            /* [compile] */
 int64_t      hwr_eval_component_add(int32_t use_pulley, int32_t a, int32_t b);  /* [compile] */
 int64_t      hwr_eval_host_import(int32_t use_pulley, int32_t x);               /* [compile] */

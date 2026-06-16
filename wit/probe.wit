@@ -9,3 +9,20 @@ world workspace-probe {
   import workspace;
   export read-names: func() -> list<portfolio-name>;
 }
+
+// P3 substrate: the generic Dart-serviced host-call round-trip. A host import the
+// guest calls suspends the run; the request surfaces to the caller (Dart) via the
+// step/poll C ABI; the caller services it app-side (gated) and resolves the value;
+// the run resumes. `wasi:http` and `ai:inference` both ride this round-trip.
+interface hostcall {
+  // Opaque request -> opaque response. The host impl is async (it awaits the
+  // caller-supplied value); the guest sees an ordinary synchronous call.
+  call: func(request: list<u8>) -> list<u8>;
+}
+
+// Test world for the P3 round-trip: the guest forwards its input through the
+// gated `hostcall.call` and returns whatever the host resolved.
+world p3-probe {
+  import hostcall;
+  export run: func(input: list<u8>) -> list<u8>;
+}

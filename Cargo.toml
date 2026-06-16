@@ -34,14 +34,19 @@ wasmtime = { version = "45.0.1", default-features = false, features = [
 ] }
 # Minimal executor to drive `call_async` to completion behind a synchronous C
 # entrypoint — the "block on a blockable worker isolate" bridge (docs 51/52).
-pollster = { version = "0.4.0", optional = true }
+# Base (non-optional) because the P3 host-call round-trip must work on the iOS
+# no-JIT build too, not only `compile` builds.
+pollster = "0.4.0"
+# Oneshot channel for the P3 round-trip: the host import awaits a value the
+# caller (Dart) supplies via `hwr_p3_resolve` from another thread.
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
 
 [features]
 # Desktop / Android / CI: in-process Cranelift compilation + `wat` parsing +
 # the async block_on executor. iOS builds with `--no-default-features` → runtime
 # + Pulley interpreter only (modules precompiled off-device; Cranelift unshipped).
 default = ["compile"]
-compile = ["wasmtime/cranelift", "wasmtime/wat", "dep:pollster"]
+compile = ["wasmtime/cranelift", "wasmtime/wat"]
 # Builds `examples/bench_ios.rs`, which embeds the precompiled artifact via
 # include_bytes! (run `gen_bench_artifact` first). Kept behind a feature so the
 # default `cargo test`/`cargo build` never needs the generated file present.

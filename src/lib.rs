@@ -673,6 +673,356 @@ pub unsafe extern "C" fn hwr_instance_new_precompiled(
     .unwrap_or(std::ptr::null_mut())
 }
 
+// ── P3: Dart-serviced host-call round-trip (step/poll bridge) ────────────────
+//
+// A host import (`hellohq:plugin/hostcall.call`) the guest calls **suspends** the
+// run; the request surfaces to the caller (Dart) via the blocking `hwr_p3_poll`;
+// the caller services it app-side — gated — and `hwr_p3_resolve`s the value; the
+// run resumes. `wasi:http` and `ai:inference` both ride this round-trip.
+//
+// Design (doc 51 "step() poll loop"): the `Store` is thread-affine, so it lives
+// on a dedicated worker thread driven by `block_on`; only byte buffers cross
+// between that thread and the caller. The host import's future awaits a
+// `oneshot` the caller completes from another thread via `hwr_p3_resolve`,
+// unparking the worker. The event channel carries the request out + the run's
+// final result; the `oneshot` carries the response in. No JIT needed — works on
+// the iOS Pulley build (the C entrypoint deserializes a precompiled component).
+
+/// Poll status. Note: `hwr_p3_poll` BLOCKS until the next event, so it returns
+/// only these terminal-ish states (never a "running" spin state).
+pub const HWR_P3_PENDING: i32 = 1; // a host call awaits a value (read request, then resolve)
+pub const HWR_P3_DONE: i32 = 2; // run finished OK (read result)
+pub const HWR_P3_ERROR: i32 = 3; // run errored (result holds the message)
+
+enum P3Event {
+    HostCall {
+        request: Vec<u8>,
+        respond: futures_channel::oneshot::Sender<Vec<u8>>,
+    },
+    Done(Result<Vec<u8>, String>),
+}
+
+/// A P3 run in flight. Opaque to the C ABI.
+pub struct HwrP3Session {
+    rx: std::sync::mpsc::Receiver<P3Event>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    pending_request: Vec<u8>,
+    pending_respond: Option<futures_channel::oneshot::Sender<Vec<u8>>>,
+    result: Vec<u8>,
+    finished: bool,
+}
+
+/// Plain engine builder available in every build (no Cranelift) — the P3 thread
+/// only instantiates + runs; compilation happened off-device.
+fn p3_engine(use_pulley: bool) -> wasmtime::Result<wasmtime::Engine> {
+    let mut cfg = wasmtime::Config::new();
+    if use_pulley {
+        cfg.target("pulley64")?;
+    }
+    wasmtime::Engine::new(&cfg)
+}
+
+/// The worker-thread future: wire the gated `hostcall.call` host import (routes
+/// each request out the channel and awaits the caller's `oneshot`), instantiate
+/// the `p3-probe` guest, and drive `run(input) -> output`.
+async fn p3_drive(
+    engine: &wasmtime::Engine,
+    component: &wasmtime::component::Component,
+    input: Vec<u8>,
+    tx: std::sync::mpsc::Sender<P3Event>,
+) -> Result<Vec<u8>, String> {
+    let e2s = |e: wasmtime::Error| e.to_string();
+    let mut linker = wasmtime::component::Linker::<std::sync::mpsc::Sender<P3Event>>::new(engine);
+    linker
+        .instance("hellohq:plugin/hostcall@0.1.0")
+        .map_err(e2s)?
+        .func_wrap_async(
+            "call",
+            |store: wasmtime::StoreContextMut<'_, std::sync::mpsc::Sender<P3Event>>,
+             (request,): (Vec<u8>,)| {
+                // Surface the request synchronously; the future just waits for
+                // the caller-supplied response (the guest is suspended here).
+                let (respond, rx) = futures_channel::oneshot::channel();
+                let _ = store.data().send(P3Event::HostCall { request, respond });
+                Box::new(async move {
+                    match rx.await {
+                        Ok(resp) => Ok((resp,)),
+                        Err(_) => Err(wasmtime::Error::msg("p3: resolve channel cancelled")),
+                    }
+                })
+            },
+        )
+        .map_err(e2s)?;
+
+    let mut store = wasmtime::Store::new(engine, tx);
+    let instance = linker
+        .instantiate_async(&mut store, component)
+        .await
+        .map_err(e2s)?;
+    let run = instance
+        .get_typed_func::<(Vec<u8>,), (Vec<u8>,)>(&mut store, "run")
+        .map_err(e2s)?;
+    let (out,) = run.call_async(&mut store, (input,)).await.map_err(e2s)?;
+    Ok(out)
+}
+
+/// Spawn the worker thread for a P3 run. `engine`/`component` are `Send` and move
+/// onto the thread, which owns the `Store`. Available in every build.
+fn p3_run_session(
+    engine: wasmtime::Engine,
+    component: wasmtime::component::Component,
+    input: Vec<u8>,
+) -> HwrP3Session {
+    let (tx, rx) = std::sync::mpsc::channel::<P3Event>();
+    let done_tx = tx.clone();
+    let thread = std::thread::spawn(move || {
+        let result = pollster::block_on(p3_drive(&engine, &component, input, tx));
+        let _ = done_tx.send(P3Event::Done(result));
+    });
+    HwrP3Session {
+        rx,
+        thread: Some(thread),
+        pending_request: Vec::new(),
+        pending_respond: None,
+        result: Vec::new(),
+        finished: false,
+    }
+}
+
+impl HwrP3Session {
+    /// Block until the next event: a pending host call, or run completion.
+    fn poll(&mut self) -> i32 {
+        if self.finished {
+            return HWR_P3_DONE;
+        }
+        match self.rx.recv() {
+            Ok(P3Event::HostCall { request, respond }) => {
+                self.pending_request = request;
+                self.pending_respond = Some(respond);
+                HWR_P3_PENDING
+            }
+            Ok(P3Event::Done(Ok(out))) => {
+                self.result = out;
+                self.finished = true;
+                HWR_P3_DONE
+            }
+            Ok(P3Event::Done(Err(msg))) => {
+                self.result = msg.into_bytes();
+                self.finished = true;
+                HWR_P3_ERROR
+            }
+            // Worker thread vanished without a Done (panic) — treat as error.
+            Err(_) => {
+                self.finished = true;
+                HWR_P3_ERROR
+            }
+        }
+    }
+
+    fn request(&self) -> &[u8] {
+        &self.pending_request
+    }
+
+    /// Supply the response to the pending host call, resuming the guest.
+    fn resolve(&mut self, response: Vec<u8>) {
+        if let Some(respond) = self.pending_respond.take() {
+            let _ = respond.send(response);
+        }
+        self.pending_request.clear();
+    }
+
+    fn result(&self) -> &[u8] {
+        &self.result
+    }
+}
+
+impl Drop for HwrP3Session {
+    fn drop(&mut self) {
+        // Cancel any in-flight host call so the worker's await errors out and the
+        // run unwinds, then join. Dropping `rx` also drops buffered events
+        // (cancelling their responders) so a never-polled call can't wedge join.
+        self.pending_respond.take();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Start a P3 run: deserialize a precompiled component (the iOS no-JIT path) and
+/// begin executing its `run(input) -> output` export on a worker thread. Returns
+/// a session handle, or null on failure. `use_pulley != 0` selects the Pulley
+/// backend. Drive it with [hwr_p3_poll] / [hwr_p3_resolve]; free with
+/// [hwr_p3_free].
+///
+/// # Safety
+/// `component`/`input` must point to `component_len`/`input_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3_start(
+    use_pulley: i32,
+    component: *const u8,
+    component_len: usize,
+    input: *const u8,
+    input_len: usize,
+) -> *mut HwrP3Session {
+    std::panic::catch_unwind(|| {
+        if component.is_null() {
+            return std::ptr::null_mut();
+        }
+        let comp_bytes = std::slice::from_raw_parts(component, component_len);
+        let input_bytes = if input.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(input, input_len).to_vec()
+        };
+        let engine = match p3_engine(use_pulley != 0) {
+            Ok(e) => e,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        // SAFETY: caller guarantees the bytes came from this runtime's
+        // precompile/serialize (the trust boundary is the SHA-pinned fetch).
+        let component = match wasmtime::component::Component::deserialize(&engine, comp_bytes) {
+            Ok(c) => c,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        Box::into_raw(Box::new(p3_run_session(engine, component, input_bytes)))
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// As [hwr_p3_start] but **compiles** a raw component (Cranelift) instead of
+/// deserializing a precompiled one — the desktop/Android path and what the Dart
+/// host tests use directly (no off-device precompile step). Not in the iOS slice.
+///
+/// # Safety
+/// `component`/`input` must point to the given number of readable bytes.
+#[cfg(feature = "compile")]
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3_start_compile(
+    use_pulley: i32,
+    component: *const u8,
+    component_len: usize,
+    input: *const u8,
+    input_len: usize,
+) -> *mut HwrP3Session {
+    std::panic::catch_unwind(|| {
+        if component.is_null() {
+            return std::ptr::null_mut();
+        }
+        let comp_bytes = std::slice::from_raw_parts(component, component_len);
+        let input_bytes = if input.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(input, input_len).to_vec()
+        };
+        let engine = match p3_engine(use_pulley != 0) {
+            Ok(e) => e,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let component = match wasmtime::component::Component::new(&engine, comp_bytes) {
+            Ok(c) => c,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        Box::into_raw(Box::new(p3_run_session(engine, component, input_bytes)))
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Block until the run yields a pending host call or finishes. Returns
+/// [HWR_P3_PENDING] / [HWR_P3_DONE] / [HWR_P3_ERROR].
+///
+/// # Safety
+/// `session` must be a live pointer from [hwr_p3_start].
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3_poll(session: *mut HwrP3Session) -> i32 {
+    if session.is_null() {
+        return HWR_P3_ERROR;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (*session).poll()))
+        .unwrap_or(HWR_P3_ERROR)
+}
+
+/// Pointer to the pending host-call request bytes (valid after [HWR_P3_PENDING]
+/// until the next [hwr_p3_resolve]). Use with [hwr_p3_request_len].
+///
+/// # Safety
+/// `session` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3_request_ptr(session: *mut HwrP3Session) -> *const u8 {
+    if session.is_null() {
+        return std::ptr::null();
+    }
+    (*session).request().as_ptr()
+}
+
+/// Length of the pending host-call request bytes.
+///
+/// # Safety
+/// `session` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3_request_len(session: *mut HwrP3Session) -> usize {
+    if session.is_null() {
+        return 0;
+    }
+    (*session).request().len()
+}
+
+/// Supply the response to the pending host call, resuming the guest.
+///
+/// # Safety
+/// `session` must be live; `response` must point to `response_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3_resolve(
+    session: *mut HwrP3Session,
+    response: *const u8,
+    response_len: usize,
+) {
+    if session.is_null() {
+        return;
+    }
+    let resp = if response.is_null() {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(response, response_len).to_vec()
+    };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (*session).resolve(resp)));
+}
+
+/// Pointer to the final result bytes (valid after [HWR_P3_DONE]; after
+/// [HWR_P3_ERROR] it is a UTF-8 error message). Use with [hwr_p3_result_len].
+///
+/// # Safety
+/// `session` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3_result_ptr(session: *mut HwrP3Session) -> *const u8 {
+    if session.is_null() {
+        return std::ptr::null();
+    }
+    (*session).result().as_ptr()
+}
+
+/// Length of the final result bytes.
+///
+/// # Safety
+/// `session` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3_result_len(session: *mut HwrP3Session) -> usize {
+    if session.is_null() {
+        return 0;
+    }
+    (*session).result().len()
+}
+
+/// Free a P3 session, cancelling any in-flight call and joining the worker.
+///
+/// # Safety
+/// `session` must be a pointer from [hwr_p3_start] not already freed.
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3_free(session: *mut HwrP3Session) {
+    if !session.is_null() {
+        drop(Box::from_raw(session));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,6 +1180,50 @@ mod tests {
             hwr_read_portfolio_count(1, 0, 5),
             WORKSPACE_READ_DENIED as i64
         );
+    }
+
+    // P3: the Dart-serviced host-call round-trip. The guest forwards its input
+    // through the gated `hostcall.call`; the test plays the servicer (Dart's role
+    // in production): poll → read request → resolve → poll → read result.
+    #[cfg(feature = "compile")]
+    fn p3_roundtrip(use_pulley: bool) {
+        let bytes = include_bytes!("../tests/fixtures/p3_probe_guest.wasm");
+        let engine = p3_engine(use_pulley).unwrap();
+        let component =
+            wasmtime::component::Component::new(&engine, bytes.as_slice()).unwrap();
+        let mut s = p3_run_session(engine, component, b"ping".to_vec());
+
+        assert_eq!(s.poll(), HWR_P3_PENDING);
+        assert_eq!(s.request(), b"ping"); // guest forwarded input to hostcall.call
+        s.resolve(b"pong".to_vec()); // servicer (stand-in for Dart) answers
+        assert_eq!(s.poll(), HWR_P3_DONE);
+        assert_eq!(s.result(), b"pong"); // guest returned what the host resolved
+    }
+
+    #[cfg(feature = "compile")]
+    #[test]
+    fn p3_roundtrip_cranelift() {
+        p3_roundtrip(false);
+    }
+
+    #[cfg(feature = "compile")]
+    #[test]
+    fn p3_roundtrip_pulley() {
+        p3_roundtrip(true);
+    }
+
+    // The free-mid-flight path: drop a session while a host call is pending and
+    // confirm Drop cancels + joins without hanging.
+    #[cfg(feature = "compile")]
+    #[test]
+    fn p3_free_while_pending() {
+        let bytes = include_bytes!("../tests/fixtures/p3_probe_guest.wasm");
+        let engine = p3_engine(false).unwrap();
+        let component =
+            wasmtime::component::Component::new(&engine, bytes.as_slice()).unwrap();
+        let mut s = p3_run_session(engine, component, b"x".to_vec());
+        assert_eq!(s.poll(), HWR_P3_PENDING);
+        drop(s); // must not hang — Drop cancels the oneshot and joins the worker
     }
 
     #[cfg(feature = "compile")]

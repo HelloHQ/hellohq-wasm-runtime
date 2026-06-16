@@ -46,3 +46,42 @@ No `--adapt` is needed (no wasi adapter) because the guest is no_std with its
 own `dlmalloc` global allocator and imports no wasi.
 
 `scripts/regen_probe_guest.sh` runs the two commands above.
+
+## `p3_probe_guest.wasm`
+
+A WebAssembly **component** built against the `p3-probe` world
+(`../../wit/probe.wit`) for the P3 host-call round-trip proof.
+
+It imports ONLY `hellohq:plugin/hostcall` and exports `run: func(input:
+list<u8>) -> list<u8>`. Its `run` forwards `input` through the imported
+`hostcall.call(input)` and returns the result unchanged — so the host test can
+assert a `list<u8>` survives the suspend/resume round-trip host -> guest
+(import) -> host (export). NO wasi imports — the host test linker provides only
+`hostcall`, so any wasi import would fail instantiation.
+
+Verify imports/exports:
+
+```sh
+wasm-tools component wit tests/fixtures/p3_probe_guest.wasm
+# import hellohq:plugin/hostcall@0.1.0;
+# export run: func(input: list<u8>) -> list<u8>;
+```
+
+### Regenerate
+
+Source crate: `../../test-guest-p3/` (an isolated crate — its own `[workspace]`
+root — so it never joins the parent crate's `cargo build`/`cargo test`). It
+references the parent `wit/` via `path: "../wit"` in the
+`wit_bindgen::generate!` macro, so the WIT stays single-source.
+
+Same toolchain as above (`wasm32-unknown-unknown` target + `wasm-tools`):
+
+```sh
+# from repo root:
+( cd test-guest-p3 && cargo build --release --target wasm32-unknown-unknown )
+wasm-tools component new \
+  test-guest-p3/target/wasm32-unknown-unknown/release/p3_probe_guest.wasm \
+  -o tests/fixtures/p3_probe_guest.wasm
+```
+
+`scripts/regen_probe_guest.sh` regenerates both fixtures.
