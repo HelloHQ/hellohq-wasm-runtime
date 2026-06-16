@@ -62,14 +62,16 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Add iOS targets (device + simulator)
-        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios-sim
-      # Mirrors build-release.sh: the shipped iOS runtime is Pulley-only (no
-      # Cranelift), so every slice builds with --no-default-features. Compile +
-      # link only — no execution.
+      # arm64 only: iOS devices + the App Store are always arm64, and we develop
+      # on Apple Silicon, so the Intel-Mac simulator slice (x86_64-apple-ios) is
+      # not built. Device + Apple-Silicon simulator cover everything we ship/run.
+      - name: Add iOS targets (device + Apple-Silicon simulator)
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+      # The shipped iOS runtime is Pulley-only (no Cranelift), so each slice
+      # builds with --no-default-features. Compile + link only — no execution.
       - name: Cross-build iOS slices (Pulley, no JIT)
         run: |
-          for target in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios-sim; do
+          for target in aarch64-apple-ios aarch64-apple-ios-sim; do
             echo "::group::$target"
             cargo build --no-default-features --target "$target" --locked
             echo "::endgroup::"
