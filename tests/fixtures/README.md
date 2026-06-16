@@ -227,4 +227,58 @@ wasm-tools component new \
   -o tests/fixtures/inference_guest.wasm
 ```
 
-`scripts/regen_probe_guest.sh` regenerates all six fixtures.
+`scripts/regen_probe_guest.sh` regenerates all fixtures.
+
+## `storage_events_guest.wasm`
+
+A WebAssembly **component** built against the `storage-events-guest` world
+(`../../wit/probe.wit` + `../../wit/world.wit`) for the SYNCHRONOUS storage +
+events end-to-end proof (`tests/storage_events.rs`) — the last two doc-53
+interfaces.
+
+It imports ONLY `hellohq:plugin/storage`, `hellohq:plugin/events`, and the
+type-only `hellohq:plugin/types` (no wasi — the host's
+`StorageEventsHost::add_to_linker` satisfies all three) and exports `run: func()
+-> list<u8>` (a PLAIN, non-async func — `storage`/`events` are sync, non-streaming
+host imports). Its `run` runs a storage round-trip (`set("greeting","hello")`,
+`set("count",…)`, `get("greeting")`, `list-keys` -> 2, `delete("count")`,
+`list-keys` -> 1) plus `events.emit({kind:"ready", payload:"ok"})`, and returns a
+compact summary `"<get-bytes>|<count1>|<count2>"` (e.g. `hello|2|1`). On any
+storage `Err` (the gate-denied case) it short-circuits and returns the marker
+`"ERR:<code>"` (e.g. `ERR:permission-denied`).
+
+Note: `wasm-tools` tree-shakes the unused `storage.clear` func out of the
+imported interface (the guest never calls it), so the imported `storage` shows
+only `get`/`set`/`delete`/`list-keys`. The full interface (incl. `clear`) lives
+in `wit/world.wit` and is implemented + unit-tested host-side.
+
+Verify imports/exports:
+
+```sh
+wasm-tools component wit tests/fixtures/storage_events_guest.wasm
+# import hellohq:plugin/types@0.1.0;
+# import hellohq:plugin/storage@0.1.0;
+# import hellohq:plugin/events@0.1.0;
+# export run: func() -> list<u8>;
+```
+
+### Regenerate
+
+Source crate: `../../test-guest-storage-events/` (an isolated crate — its own
+`[workspace]` root). no_std with its own `dlmalloc` global allocator so it pulls
+in NO wasi. It references the parent `wit/` via `path: "../wit"` in the
+`wit_bindgen::generate!` macro (with `generate_all` to pull in the
+transitively-used `hellohq:plugin/types` interface), so the WIT stays
+single-source.
+
+Same toolchain as above (`wasm32-unknown-unknown` target + `wasm-tools`):
+
+```sh
+# from repo root:
+( cd test-guest-storage-events && cargo build --release --target wasm32-unknown-unknown )
+wasm-tools component new \
+  test-guest-storage-events/target/wasm32-unknown-unknown/release/storage_events_guest.wasm \
+  -o tests/fixtures/storage_events_guest.wasm
+```
+
+`scripts/regen_probe_guest.sh` regenerates all fixtures.

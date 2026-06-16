@@ -26,3 +26,17 @@ world p3-probe {
   import hostcall;
   export run: func(input: list<u8>) -> list<u8>;
 }
+
+// Test-only world (same hellohq:plugin package) for the SYNCHRONOUS storage +
+// events end-to-end proof (doc 53, the last two interfaces). A guest built
+// against this world imports `storage` + `events` (and transitively `types`),
+// exercises a realistic storage round-trip plus an `events.emit`, and returns a
+// compact summary so the host test can assert. Both `storage` and `events` are
+// SYNC host imports (plain `&mut self`, no `stream`/`Accessor`), so `run` is a
+// plain (non-async) func. NOT shipped to plugins; the real plugin world is
+// `plugin` in world.wit.
+world storage-events-guest {
+  import storage;
+  import events;
+  export run: func() -> list<u8>;
+}

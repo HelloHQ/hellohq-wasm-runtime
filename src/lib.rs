@@ -59,6 +59,17 @@ pub mod wasi_http;
 #[allow(dead_code)]
 pub mod inference;
 
+// The hand-built `hellohq:plugin/{storage,events}` hosts — the last two doc-53
+// interfaces. SYNCHRONOUS, non-streaming (plain `&mut self` host methods +
+// gate), so they follow the simple `workspace.read` (Option A) pattern: no P3
+// transport, no streaming, no `store`/`Accessor`. In-memory backing for the
+// demo, with production routing to Dart documented as the injection point.
+// Behind the same `wasi-http` feature, so default / `--no-default-features`
+// builds are unaffected.
+#[cfg(feature = "wasi-http")]
+#[allow(dead_code)]
+pub mod storage_events;
+
 pub const HWR_ABI_VERSION: u32 = 1;
 
 // In-process Wasm compilation/execution requires Cranelift and is available only

@@ -68,3 +68,18 @@ wasm-tools component new "$INFER_CORE" -o "$INFER_OUT"
 
 echo "Wrote $INFER_OUT"
 wasm-tools component wit "$INFER_OUT"
+
+# SYNCHRONOUS storage + events guest (storage-events-guest world in
+# wit/probe.wit): imports ONLY hellohq:plugin/{storage,events,types}, exports a
+# plain (non-async) `run` which runs a storage round-trip (set/get/list-keys/
+# delete) plus events.emit({kind:"ready",payload:"ok"}) and returns a compact
+# summary "<get-bytes>|<c1>|<c2>". Isolated crate test-guest-storage-events.
+# Drives the storage/events test (tests/storage_events.rs).
+SE_CORE="test-guest-storage-events/target/wasm32-unknown-unknown/release/storage_events_guest.wasm"
+SE_OUT="tests/fixtures/storage_events_guest.wasm"
+
+( cd test-guest-storage-events && cargo build --release --target wasm32-unknown-unknown )
+wasm-tools component new "$SE_CORE" -o "$SE_OUT"
+
+echo "Wrote $SE_OUT"
+wasm-tools component wit "$SE_OUT"
