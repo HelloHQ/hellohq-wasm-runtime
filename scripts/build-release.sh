@@ -62,10 +62,15 @@ zip_platform_dir() {
     rm -rf "$1" )
 }
 
-# Desktop / Android: DEFAULT features → Cranelift JIT.
+# Desktop / Android: Cranelift JIT + wasi-http. The `wasi-http` feature gates the
+# P3s streaming entrypoints (hwr_p3s_start_http / hwr_p3s_start_inference) that
+# back the app's network:fetch + ai:inference paths; without it those symbols
+# are stripped and the streaming round-trips return null. (It needs `compile`,
+# which the default feature provides, so it's Cranelift-only — iOS no-JIT can't
+# ship these.)
 build_jit() {
-  echo "→ cargo build --release --target $1  (default features / Cranelift)"
-  cargo build --release --target "$1"
+  echo "→ cargo build --release --features wasi-http --target $1  (Cranelift + wasi-http)"
+  cargo build --release --features wasi-http --target "$1"
 }
 
 # iOS: drop Cranelift. runtime + Pulley + component-model + async + std only.
