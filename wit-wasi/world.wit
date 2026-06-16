@@ -21,3 +21,14 @@ world http-guest {
   // must be async (a sync export traps with "cannot block a synchronous task").
   export run: async func() -> list<u8>;
 }
+
+// Guest-side world for the streaming-REQUEST-body (POST) test. Identical surface
+// to `http-guest`, but the guest constructs a POST request carrying a body
+// `stream<u8>` (writing "req-body-123"), calls handler.handle, and returns the
+// response status + body. Proves the host reads the guest's request-body stream
+// and emits it as OUT frames before ending the outbound stream.
+world http-guest-post {
+  import wasi:http/types@0.3.0-rc-2026-01-06;
+  import wasi:http/handler@0.3.0-rc-2026-01-06;
+  export run: async func() -> list<u8>;
+}

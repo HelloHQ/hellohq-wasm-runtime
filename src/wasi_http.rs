@@ -22,6 +22,8 @@
 //! part of normal builds.
 
 use std::collections::HashMap;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 wasmtime::component::bindgen!({
     path: "wit-wasi",
@@ -995,10 +997,12 @@ async fn handle_via_transport<T: Send>(
     accessor: &wasmtime::component::Accessor<T, wasmtime::component::HasSelf<WasiHttpHost>>,
     request: wasmtime::component::Resource<Request>,
 ) -> Result<wasmtime::component::Resource<Response>, ErrorCode> {
-    // (1) Read request metadata + headers, build the head bytes, emit the
-    //     request OUT, and take the inbound receiver — all inside one `with`,
-    //     dropping the borrow before we await.
-    let inbound = accessor.with(|mut access| {
+    // (1) Read request metadata + headers, build the head bytes, emit the head
+    //     OUT, take the request-body stream (if any), and take the inbound
+    //     receiver — all inside one `with`, dropping the borrow before we await.
+    //     The outbound stream is NOT ended here: if there's a request body we
+    //     stream its bytes out as further OUT frames first (step 1b).
+    let (inbound, req_body) = accessor.with(|mut access| {
         let host = access.get();
         let Some(req) = host.requests.get(request.rep()) else {
             return Err(ErrorCode::InternalError(Some(
@@ -1034,18 +1038,61 @@ async fn handle_via_transport<T: Send>(
             head.push_str(&String::from_utf8_lossy(value));
         }
 
+        // Take the stashed request-body stream out (so we can stream it OUT) and
+        // the inbound receiver out (so we can await it without the borrow).
         let host = access.get();
+        let req_body = host
+            .requests
+            .get_mut(request.rep())
+            .and_then(|r| r.body.take());
         let Some(transport) = host.transport.as_mut() else {
             return Err(ErrorCode::InternalError(Some(
                 "wasi:http handler: transport missing".to_string(),
             )));
         };
         transport.out.chunk(head.into_bytes());
-        transport.out.end();
-        // Take the inbound receiver out so we can await it without the borrow.
         let inbound = transport.inbound.take();
-        Ok(inbound)
+        Ok((inbound, req_body))
     })?;
+
+    // (1b) If the request carries a body, stream it OUT frame-by-frame before
+    //      ending the outbound stream. We read the guest's `stream<u8>`
+    //      host-side via a `StreamConsumer` ([`RequestBodyConsumer`]) piped onto
+    //      the body reader: it forwards each consumed batch through an mpsc
+    //      channel which we drain here, emitting one OUT chunk per batch. When
+    //      the consumer's sender drops (guest closed the body stream), the
+    //      receiver yields `None` and we stop. Then we `out.end()`.
+    if let Some(body) = req_body {
+        let (body_tx, mut body_rx) = futures_channel::mpsc::unbounded::<Vec<u8>>();
+        accessor.with(|mut access| {
+            // `pipe` installs the consumer; it's driven by the same concurrent
+            // executor that polls this `handle` task, so it makes progress while
+            // we await `body_rx` below.
+            body.pipe(&mut access, RequestBodyConsumer { tx: body_tx })
+                .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))
+        })?;
+
+        use futures_util::StreamExt;
+        while let Some(chunk) = body_rx.next().await {
+            if chunk.is_empty() {
+                continue;
+            }
+            accessor.with(|mut access| {
+                let host = access.get();
+                if let Some(transport) = host.transport.as_mut() {
+                    transport.out.chunk(chunk);
+                }
+            });
+        }
+    }
+
+    // End the outbound stream: head (+ any body frames) have been emitted.
+    accessor.with(|mut access| {
+        let host = access.get();
+        if let Some(transport) = host.transport.as_mut() {
+            transport.out.end();
+        }
+    });
 
     let Some(mut inbound) = inbound else {
         return Err(ErrorCode::InternalError(Some(
@@ -1083,14 +1130,11 @@ async fn handle_via_transport<T: Send>(
         }
     }
 
-    let mut body_bytes: Vec<u8> = Vec::new();
-    while let Some(chunk) = inbound.next().await {
-        body_bytes.extend_from_slice(&chunk);
-    }
-
     // (3) Build the `Response` resource (status + headers + body stream) in a
-    //     fresh `with`, minting the body stream + a ready `Ok(None)` trailers
-    //     future, and return it.
+    //     fresh `with`. Rather than buffering the remaining inbound frames into
+    //     a `Vec`, hand the still-open receiver to a custom `StreamProducer`
+    //     ([`ResponseBodyProducer`]) that forwards each inbound chunk to the
+    //     guest's `stream<u8>` as it arrives — true chunk-by-chunk streaming.
     accessor.with(|mut access| {
         let host = access.get();
         let headers_rep = host.fields.insert(FieldsData {
@@ -1098,8 +1142,9 @@ async fn handle_via_transport<T: Send>(
             immutable: false,
         });
 
-        let body = wasmtime::component::StreamReader::new(&mut access, body_bytes)
-            .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))?;
+        let body =
+            wasmtime::component::StreamReader::new(&mut access, ResponseBodyProducer { inbound })
+                .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))?;
         let trailers: TrailersFuture = wasmtime::component::FutureReader::new(&mut access, async {
             Ok::<_, wasmtime::Error>(Ok::<_, ErrorCode>(None))
         })
@@ -1114,6 +1159,111 @@ async fn handle_via_transport<T: Send>(
         });
         Ok(wasmtime::component::Resource::<Response>::new_own(rep))
     })
+}
+
+/// A [`StreamProducer`] that forwards inbound P3 response-body frames to the
+/// guest's `stream<u8>` chunk-by-chunk, instead of buffering the whole body
+/// into a `Vec<u8>` up front. It owns the *remaining* inbound receiver (the head
+/// frame was already consumed in `handle_via_transport`); each `poll_produce`
+/// polls the receiver and hands one frame straight to the destination.
+///
+/// [`StreamProducer`]: wasmtime::component::StreamProducer
+struct ResponseBodyProducer {
+    inbound: crate::P3sIn,
+}
+
+// Generic over the store data `D` (like the blanket `Vec<u8>` impl) so it works
+// with whatever store type `handle`'s `Accessor` carries (`Access<T, …>`), not
+// just `WasiHttpHost`.
+impl<D> wasmtime::component::StreamProducer<D> for ResponseBodyProducer {
+    type Item = u8;
+    // Match the `Vec<u8>` blanket `StreamProducer` impl: deliver each chunk by
+    // moving it into a `VecBuffer<u8>` via `Destination::set_buffer`.
+    type Buffer = wasmtime::component::VecBuffer<u8>;
+
+    fn poll_produce<'a>(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _store: wasmtime::StoreContextMut<'a, D>,
+        mut destination: wasmtime::component::Destination<'a, Self::Item, Self::Buffer>,
+        _finish: bool,
+    ) -> Poll<wasmtime::Result<wasmtime::component::StreamResult>> {
+        use futures_util::Stream;
+        use wasmtime::component::StreamResult;
+
+        // Poll the inbound receiver for the next response-body frame. The
+        // receiver registers `cx`'s waker on `Pending`, so we just propagate it.
+        match Pin::new(&mut self.inbound).poll_next(cx) {
+            // A frame arrived: hand its bytes to the guest's read buffer and
+            // report `Completed` (more frames may follow). Mirrors the `Vec<u8>`
+            // blanket impl's `dst.set_buffer(chunk.into())`.
+            Poll::Ready(Some(chunk)) => {
+                destination.set_buffer(chunk.into());
+                Poll::Ready(Ok(StreamResult::Completed))
+            }
+            // Receiver closed (caller pushed end-of-stream): end the guest stream.
+            Poll::Ready(None) => Poll::Ready(Ok(StreamResult::Dropped)),
+            // No frame yet; the waker is registered, so just wait.
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// A [`StreamConsumer`] that reads a guest's request-body `stream<u8>`
+/// host-side and forwards each consumed batch through an mpsc channel, so the
+/// `handle` driver can emit them as OUT frames. Created in `handle_via_transport`
+/// and piped onto the request-body reader; the matching receiver is drained by
+/// the driver. When this consumer is dropped (guest closed the body stream), its
+/// sender drops and the driver's receiver yields `None`.
+///
+/// [`StreamConsumer`]: wasmtime::component::StreamConsumer
+struct RequestBodyConsumer {
+    tx: futures_channel::mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl<D> wasmtime::component::StreamConsumer<D> for RequestBodyConsumer {
+    type Item = u8;
+
+    fn poll_consume(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        mut store: wasmtime::StoreContextMut<D>,
+        mut source: wasmtime::component::Source<Self::Item>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<wasmtime::component::StreamResult>> {
+        use wasmtime::component::StreamResult;
+        use wasmtime::AsContextMut;
+
+        // If asked to wrap up (cancel) without consuming, honor it immediately.
+        if finish {
+            return Poll::Ready(Ok(StreamResult::Cancelled));
+        }
+
+        // Read everything currently available into a `Vec<u8>` (which is a
+        // `ReadBuffer<u8>`), then ship it through the channel as one batch (one
+        // OUT frame).
+        let available = source.remaining(store.as_context_mut());
+        if available == 0 {
+            // Nothing to consume right now and not finishing: the source is
+            // drained for this write. Treat as end-of-stream for our purposes.
+            return Poll::Ready(Ok(StreamResult::Dropped));
+        }
+        let mut buffer: Vec<u8> = Vec::with_capacity(available);
+        source
+            .read(store.as_context_mut(), &mut buffer)
+            .map_err(|e| anyhow_msg(format!("request body read failed: {e}")))?;
+
+        let _ = self.tx.unbounded_send(buffer);
+
+        // More may follow; report `Completed` (we consumed ≥1 item).
+        Poll::Ready(Ok(StreamResult::Completed))
+    }
+}
+
+/// Build a `wasmtime::Error` from a message string (avoids pulling in `anyhow`
+/// macros for the few error sites in this module).
+fn anyhow_msg(msg: String) -> wasmtime::Error {
+    wasmtime::Error::msg(msg)
 }
 
 /// Stable string form of a `MethodOwned` for the echo summary.

@@ -67,7 +67,31 @@ const uint8_t* hwr_p3_result_ptr(HwrP3Session*);      /* [no-JIT] valid after DO
 size_t         hwr_p3_result_len(HwrP3Session*);      /* [no-JIT] */
 void           hwr_p3_free(HwrP3Session*);            /* [no-JIT] cancels + joins        */
 
+/* ── P3 v2: streaming host-call round-trip (framed bidirectional channel) ── */
+/* For STREAMED bodies (wasi:http): the request body flows OUT (host -> caller)
+ * chunk by chunk, the response body flows IN (caller -> host). The caller drains
+ * OUT/OUT_END, then pushes IN chunks + push_end, then polls for DONE. */
+typedef struct HwrP3Stream HwrP3Stream;
+#define HWR_P3S_OUT      0 /* an outbound chunk is ready (read via out ptr/len)  */
+#define HWR_P3S_OUT_END  1 /* outbound (request) finished; now push inbound      */
+#define HWR_P3S_DONE     2 /* run finished OK (read result)                      */
+#define HWR_P3S_ERROR    3 /* run errored (result holds a UTF-8 message)         */
+
+int32_t        hwr_p3s_poll(HwrP3Stream*);             /* [no-JIT] BLOCKS; HWR_P3S_*      */
+const uint8_t* hwr_p3s_out_ptr(HwrP3Stream*);          /* [no-JIT] current outbound chunk */
+size_t         hwr_p3s_out_len(HwrP3Stream*);          /* [no-JIT] */
+void           hwr_p3s_push(HwrP3Stream*, const uint8_t* chunk, size_t len); /* [no-JIT] inbound chunk */
+void           hwr_p3s_push_end(HwrP3Stream*);         /* [no-JIT] close inbound          */
+const uint8_t* hwr_p3s_result_ptr(HwrP3Stream*);       /* [no-JIT] after DONE/ERROR       */
+size_t         hwr_p3s_result_len(HwrP3Stream*);       /* [no-JIT] */
+void           hwr_p3s_free(HwrP3Stream*);             /* [no-JIT] closes inbound + joins */
+
 /* ── Compile-time only (Cranelift); NOT in the iOS slice ─────────────────── */
+/* Run the wasi:http guest [component], routing handler.handle through the P3 v2
+ * transport: the guest's outbound request surfaces as OUT frames, the caller
+ * (Dart) services it (gated) and pushes the response IN. (wasi-http feature.) */
+HwrP3Stream* hwr_p3s_start_http(int32_t use_pulley, const uint8_t* component,
+                                size_t component_len);                          /* [compile,wasi-http] */
 /* Start a P3 run by COMPILING a raw component (desktop/Android; host tests). */
 HwrP3Session* hwr_p3_start_compile(int32_t use_pulley, const uint8_t* component, size_t component_len,
                                    const uint8_t* input, size_t input_len);  /* [compile] */

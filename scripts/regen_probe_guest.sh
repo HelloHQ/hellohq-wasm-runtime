@@ -39,3 +39,17 @@ wasm-tools component new "$HTTP_CORE" -o "$HTTP_OUT"
 
 echo "Wrote $HTTP_OUT"
 wasm-tools component wit "$HTTP_OUT"
+
+# Streaming-REQUEST-body (POST) guest (http-guest-post world in wit-wasi):
+# imports ONLY wasi:http/{types,handler}, exports `run` which builds a POST
+# request carrying a body stream ("req-body-123"), calls handler.handle, and
+# returns the response status + body. Isolated crate test-guest-http-post.
+# Drives the request-body streaming test (tests/http_handle.rs).
+POST_CORE="test-guest-http-post/target/wasm32-unknown-unknown/release/http_guest_post.wasm"
+POST_OUT="tests/fixtures/http_guest_post.wasm"
+
+( cd test-guest-http-post && cargo build --release --target wasm32-unknown-unknown )
+wasm-tools component new "$POST_CORE" -o "$POST_OUT"
+
+echo "Wrote $POST_OUT"
+wasm-tools component wit "$POST_OUT"

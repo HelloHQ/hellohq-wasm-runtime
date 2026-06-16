@@ -26,6 +26,11 @@ use wasmtime::{Config, Engine, Store};
 /// `run() -> list<u8>`. Regen: scripts/regen_probe_guest.sh.
 const GUEST_WASM: &[u8] = include_bytes!("fixtures/http_guest.wasm");
 
+/// The POST fixture guest. Imports `wasi:http/{types,handler}`, exports
+/// `run() -> list<u8>`; builds a POST request carrying a body `stream<u8>`
+/// ("req-body-123"). Regen: scripts/regen_probe_guest.sh.
+const POST_GUEST_WASM: &[u8] = include_bytes!("fixtures/http_guest_post.wasm");
+
 /// Build an engine with Component Model async + concurrency support (required to
 /// mint streams/futures), optionally on the Pulley (no-JIT) backend.
 fn engine(use_pulley: bool) -> wasmtime::Result<Engine> {
@@ -133,11 +138,19 @@ fn run_via_transport(use_pulley: bool) -> Vec<u8> {
         );
 
         // (2) Push the framed response back IN: head ("{status}\n{header}") then
-        //     a body chunk, then close inbound.
+        //     MULTIPLE body chunks (proving the host streams them through to the
+        //     guest frame-by-frame via `ResponseBodyProducer`, not buffered into
+        //     one `Vec`), then close inbound. The guest must observe the
+        //     concatenation of all three chunks.
         let resp_head = b"200\nx-test: yes";
         hwr_p3s_push(session, resp_head.as_ptr(), resp_head.len());
-        let body = b"hello-from-servicer";
-        hwr_p3s_push(session, body.as_ptr(), body.len());
+        for chunk in [
+            b"chunk-A".as_slice(),
+            b"chunk-B".as_slice(),
+            b"chunk-C".as_slice(),
+        ] {
+            hwr_p3s_push(session, chunk.as_ptr(), chunk.len());
+        }
         hwr_p3s_push_end(session);
 
         // (3) Poll to DONE and read the run result.
@@ -166,8 +179,9 @@ fn assert_transport(use_pulley: bool) {
     assert_eq!(status, 200, "status (use_pulley={use_pulley})");
     let body = String::from_utf8_lossy(&out[2..]);
     assert_eq!(
-        body, "hello-from-servicer",
-        "transport body (use_pulley={use_pulley})"
+        body, "chunk-Achunk-Bchunk-C",
+        "transport body should be the concatenation of all streamed chunks \
+         (use_pulley={use_pulley})"
     );
 }
 
@@ -179,4 +193,101 @@ fn cranelift_http_handle_via_transport() {
 #[test]
 fn pulley_http_handle_via_transport() {
     assert_transport(true);
+}
+
+// ─── Follow-on #1: streaming REQUEST body (POST) ─────────────────────────────
+//
+// The POST guest builds a request carrying a body `stream<u8>` ("req-body-123").
+// The host reads that stream host-side and emits it as OUT frames after the
+// head, before ending the outbound stream. We drain the OUT frames and assert
+// they include BOTH the head (the POST line) AND the body bytes — proving the
+// request body streamed through to the servicer — then push a 200 response and
+// assert the guest received it.
+
+/// Drive the POST round-trip: start the session with the POST guest, drain the
+/// outbound frames (head + request body), push a 200 response, return the
+/// guest's run result and the concatenated outbound bytes.
+fn run_post_via_transport(use_pulley: bool) -> (Vec<u8>, Vec<u8>) {
+    unsafe {
+        let session = hwr_p3s_start_http(
+            use_pulley as i32,
+            POST_GUEST_WASM.as_ptr(),
+            POST_GUEST_WASM.len(),
+        );
+        assert!(!session.is_null(), "start failed (use_pulley={use_pulley})");
+
+        // (1) Drain ALL outbound frames (head + streamed request body) to
+        //     OUT_END. We concatenate them so we can assert both the head line
+        //     and the body bytes appear.
+        let mut outbound = Vec::new();
+        loop {
+            match hwr_p3s_poll(session) {
+                HWR_P3S_OUT => {
+                    let ptr = hwr_p3s_out_ptr(session);
+                    let len = hwr_p3s_out_len(session);
+                    outbound.extend_from_slice(std::slice::from_raw_parts(ptr, len));
+                }
+                HWR_P3S_OUT_END => break,
+                other => {
+                    panic!("unexpected status while draining: {other} (use_pulley={use_pulley})")
+                }
+            }
+        }
+
+        // (2) Push a framed 200 response, then close inbound.
+        let resp_head = b"200\nx-test: yes";
+        hwr_p3s_push(session, resp_head.as_ptr(), resp_head.len());
+        let body = b"post-ok";
+        hwr_p3s_push(session, body.as_ptr(), body.len());
+        hwr_p3s_push_end(session);
+
+        // (3) Poll to DONE and read the run result.
+        assert_eq!(
+            hwr_p3s_poll(session),
+            HWR_P3S_DONE,
+            "expected DONE (use_pulley={use_pulley})"
+        );
+        let rptr = hwr_p3s_result_ptr(session);
+        let rlen = hwr_p3s_result_len(session);
+        let result = std::slice::from_raw_parts(rptr, rlen).to_vec();
+        hwr_p3s_free(session);
+        (result, outbound)
+    }
+}
+
+fn assert_post_transport(use_pulley: bool) {
+    let (out, outbound) = run_post_via_transport(use_pulley);
+
+    // The outbound frames must carry the POST head AND the streamed request body
+    // bytes — proving the request body reached the servicer via streaming.
+    let outbound_str = String::from_utf8_lossy(&outbound);
+    assert!(
+        outbound_str.starts_with("POST ") && outbound_str.contains("example.com/submit"),
+        "outbound missing POST head: {outbound_str:?} (use_pulley={use_pulley})"
+    );
+    assert!(
+        outbound_str.contains("req-body-123"),
+        "outbound missing streamed request body bytes: {outbound_str:?} \
+         (use_pulley={use_pulley})"
+    );
+
+    // The guest received the servicer's 200 response.
+    assert!(
+        out.len() >= 2,
+        "missing status prefix (use_pulley={use_pulley})"
+    );
+    let status = u16::from_le_bytes([out[0], out[1]]);
+    assert_eq!(status, 200, "status (use_pulley={use_pulley})");
+    let body = String::from_utf8_lossy(&out[2..]);
+    assert_eq!(body, "post-ok", "response body (use_pulley={use_pulley})");
+}
+
+#[test]
+fn cranelift_http_handle_post_request_body() {
+    assert_post_transport(false);
+}
+
+#[test]
+fn pulley_http_handle_post_request_body() {
+    assert_post_transport(true);
 }

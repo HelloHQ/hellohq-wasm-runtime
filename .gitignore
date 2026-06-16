@@ -18,3 +18,4 @@ ios-bench/Resources/*.cwasm
 /test-guest/target
 /test-guest-p3/target
 /test-guest-http/target
+/test-guest-http-post/target

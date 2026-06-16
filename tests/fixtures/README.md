@@ -133,4 +133,49 @@ wasm-tools component new \
   -o tests/fixtures/http_guest.wasm
 ```
 
-`scripts/regen_probe_guest.sh` regenerates all three fixtures.
+`scripts/regen_probe_guest.sh` regenerates all four fixtures.
+
+## `http_guest_post.wasm`
+
+A WebAssembly **component** built against the `http-guest-post` world
+(`../../wit-wasi/world.wit`) for the streaming-REQUEST-body (POST) proof
+(`tests/http_handle.rs`).
+
+Same import/export surface as `http_guest.wasm` (imports ONLY `wasi:http/types`
++ `wasi:http/handler`; exports `run: async func() -> list<u8>`), but `run`
+builds a **POST** request to `example.com/submit` carrying a body `stream<u8>`.
+It mints the body stream via `wit_stream::new::<u8>()`, hands the reader half to
+`request::new(headers, Some(reader), …)`, and `wit_bindgen::spawn_local`s a task
+that writes the bytes `"req-body-123"` to the writer half and then drops it
+(closing the stream). The write runs concurrently with `handle().await` because
+the host only drains the request body while servicing `handle`. The host reads
+that stream host-side (via a `StreamConsumer`) and emits it as OUT frames after
+the request head — so the host test can assert the body bytes reached the
+servicer.
+
+The `async-spawn` feature of `wit-bindgen` is enabled (in the guest crate's
+`Cargo.toml`) for `spawn_local`.
+
+Verify imports/exports:
+
+```sh
+wasm-tools component wit tests/fixtures/http_guest_post.wasm
+# import wasi:http/types@0.3.0-rc-2026-01-06;
+# import wasi:http/handler@0.3.0-rc-2026-01-06;
+# export run: async func() -> list<u8>;
+```
+
+### Regenerate
+
+Source crate: `../../test-guest-http-post/` (an isolated crate — its own
+`[workspace]` root). References the parent `wit-wasi/` via `path: "../wit-wasi"`.
+
+```sh
+# from repo root:
+( cd test-guest-http-post && cargo build --release --target wasm32-unknown-unknown )
+wasm-tools component new \
+  test-guest-http-post/target/wasm32-unknown-unknown/release/http_guest_post.wasm \
+  -o tests/fixtures/http_guest_post.wasm
+```
+
+`scripts/regen_probe_guest.sh` regenerates all five fixtures.
