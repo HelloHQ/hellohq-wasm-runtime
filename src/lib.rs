@@ -1192,8 +1192,7 @@ mod tests {
     fn p3_roundtrip(use_pulley: bool) {
         let bytes = include_bytes!("../tests/fixtures/p3_probe_guest.wasm");
         let engine = p3_engine(use_pulley).unwrap();
-        let component =
-            wasmtime::component::Component::new(&engine, bytes.as_slice()).unwrap();
+        let component = wasmtime::component::Component::new(&engine, bytes.as_slice()).unwrap();
         let mut s = p3_run_session(engine, component, b"ping".to_vec());
 
         assert_eq!(s.poll(), HWR_P3_PENDING);
@@ -1222,8 +1221,7 @@ mod tests {
     fn p3_free_while_pending() {
         let bytes = include_bytes!("../tests/fixtures/p3_probe_guest.wasm");
         let engine = p3_engine(false).unwrap();
-        let component =
-            wasmtime::component::Component::new(&engine, bytes.as_slice()).unwrap();
+        let component = wasmtime::component::Component::new(&engine, bytes.as_slice()).unwrap();
         let mut s = p3_run_session(engine, component, b"x".to_vec());
         assert_eq!(s.poll(), HWR_P3_PENDING);
         drop(s); // must not hang — Drop cancels the oneshot and joins the worker
