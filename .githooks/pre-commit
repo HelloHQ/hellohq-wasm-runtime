@@ -1,0 +1,27 @@
+#!/usr/bin/env sh
+#
+# Pre-commit gate for hellohq-wasm-runtime. Runs the same fmt + clippy checks the
+# CI `lint` job enforces, so formatting/lint failures are caught here instead of
+# in CI. Runs only when Rust sources or Cargo manifests are staged (doc-only or
+# workflow-only commits are unaffected).
+#
+# Enable once per clone:    git config core.hooksPath .githooks
+# Bypass for one commit:    git commit --no-verify
+set -eu
+
+# Skip unless the commit touches Rust / Cargo files.
+staged="$(git diff --cached --name-only --diff-filter=ACM)"
+echo "$staged" | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$' || exit 0
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "pre-commit: cargo not on PATH — skipping fmt/clippy" >&2
+  exit 0
+fi
+
+echo "▶ cargo fmt --all --check"
+cargo fmt --all -- --check
+
+echo "▶ cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
+
+echo "✓ pre-commit checks passed"
