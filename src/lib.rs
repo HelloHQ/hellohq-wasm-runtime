@@ -49,6 +49,16 @@
 #[allow(dead_code)]
 pub mod wasi_http;
 
+// The hand-built `hellohq:plugin/inference` streaming host — the async-first AI
+// inference capability this crate exists for. STRUCTURALLY IDENTICAL to
+// `wasi_http`: a concurrent host method (`inference.complete`) routes through the
+// P3 v2 streaming transport and maps token deltas onto the streaming bridge.
+// Behind the same `wasi-http` feature, so default / `--no-default-features`
+// builds are unaffected.
+#[cfg(feature = "wasi-http")]
+#[allow(dead_code)]
+pub mod inference;
+
 pub const HWR_ABI_VERSION: u32 = 1;
 
 // In-process Wasm compilation/execution requires Cranelift and is available only
@@ -1324,6 +1334,77 @@ pub unsafe extern "C" fn hwr_p3s_start_http(
             crate::wasi_http::WasiHttpHost::add_to_linker(&mut linker).map_err(e2s)?;
 
             let host = crate::wasi_http::WasiHttpHost::with_transport(out, in_rx);
+            let mut store = wasmtime::Store::new(&engine, host);
+            let instance = linker
+                .instantiate_async(&mut store, &component)
+                .await
+                .map_err(e2s)?;
+            let run = instance
+                .get_typed_func::<(), (Vec<u8>,)>(&mut store, "run")
+                .map_err(e2s)?;
+            let (output,) = run.call_async(&mut store, ()).await.map_err(e2s)?;
+            Ok(output)
+        });
+        Box::into_raw(Box::new(session))
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Start a streaming session that runs the `hellohq:plugin/inference` guest over
+/// the P3 v2 transport — the async-first AI inference round-trip. Builds a
+/// concurrency-enabled engine (async + optionally Pulley), compiles `component`,
+/// and runs `p3s_run_session` with a driver that instantiates the guest with an
+/// [`inference::InferenceHost`] whose transport is wired to the streaming
+/// channel. The guest's `inference.complete` then frames the request head OUT
+/// (drained via [hwr_p3s_poll]/[hwr_p3s_out_ptr]) and builds the returned
+/// `stream<string>` from the caller's pushed-IN token-delta frames
+/// ([hwr_p3s_push]/[hwr_p3s_push_end]). The run result is the guest's returned
+/// `list<u8>` (the concatenated token deltas).
+///
+/// Mirrors [hwr_p3s_start_http]. Gated on `compile` (needs Cranelift for
+/// `Component::new`).
+///
+/// # Safety
+/// `component` must point to `component_len` readable bytes.
+#[cfg(all(feature = "wasi-http", feature = "compile"))]
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3s_start_inference(
+    use_pulley: i32,
+    component: *const u8,
+    component_len: usize,
+) -> *mut HwrP3Stream {
+    std::panic::catch_unwind(|| {
+        if component.is_null() {
+            return std::ptr::null_mut();
+        }
+        let comp_bytes = std::slice::from_raw_parts(component, component_len).to_vec();
+        let use_pulley = use_pulley != 0;
+
+        // Engine: component model + async + concurrency support (to mint the
+        // token stream), matching hwr_p3s_start_http's engine builder.
+        let mut cfg = wasmtime::Config::new();
+        cfg.wasm_component_model(true);
+        cfg.wasm_component_model_async(true);
+        cfg.concurrency_support(true);
+        if use_pulley && cfg.target("pulley64").is_err() {
+            return std::ptr::null_mut();
+        }
+        let engine = match wasmtime::Engine::new(&cfg) {
+            Ok(e) => e,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let component = match wasmtime::component::Component::new(&engine, &comp_bytes) {
+            Ok(c) => c,
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let session = p3s_run_session(move |out, in_rx| async move {
+            let e2s = |e: wasmtime::Error| e.to_string();
+            let mut linker =
+                wasmtime::component::Linker::<crate::inference::InferenceHost>::new(&engine);
+            crate::inference::InferenceHost::add_to_linker(&mut linker).map_err(e2s)?;
+
+            let host = crate::inference::InferenceHost::with_transport(out, in_rx);
             let mut store = wasmtime::Store::new(&engine, host);
             let instance = linker
                 .instantiate_async(&mut store, &component)

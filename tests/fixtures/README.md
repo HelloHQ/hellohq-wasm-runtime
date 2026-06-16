@@ -178,4 +178,53 @@ wasm-tools component new \
   -o tests/fixtures/http_guest_post.wasm
 ```
 
-`scripts/regen_probe_guest.sh` regenerates all five fixtures.
+`scripts/regen_probe_guest.sh` regenerates all six fixtures.
+
+## `inference_guest.wasm`
+
+A WebAssembly **component** built against the `inference-guest` world
+(`../../wit/world.wit`) for the ai:inference streaming end-to-end proof
+(`tests/inference_complete.rs`).
+
+It imports ONLY `hellohq:plugin/inference` and `hellohq:plugin/types` (no wasi —
+the host's `InferenceHost::add_to_linker` satisfies both) and exports `run: async
+func() -> list<u8>`. Its `run` calls
+`inference.complete([{role:"user", content:"hello"}], {max-tokens:64})`, drains
+the returned `stream<string>` concatenating each token-delta string, and returns
+the concatenation as bytes — so the host test can assert streamed token deltas
+("Hel" + "lo " + "world" == "Hello world") round-trip through the full inference
+resource + stream + concurrent-complete path.
+
+`run` is `async func` because it drains the returned `stream<string>` (which
+yields). `complete` is a sync WIT func the host binds `store` (so it can mint the
+`stream<string>`); a guest may lower a concurrent host import synchronously, so
+`complete` is called blocking.
+
+Verify imports/exports:
+
+```sh
+wasm-tools component wit tests/fixtures/inference_guest.wasm
+# import hellohq:plugin/types@0.1.0;
+# import hellohq:plugin/inference@0.1.0;
+# export run: async func() -> list<u8>;
+```
+
+### Regenerate
+
+Source crate: `../../test-guest-inference/` (an isolated crate — its own
+`[workspace]` root). It references the parent `wit/` via `path: "../wit"` in the
+`wit_bindgen::generate!` macro (with `generate_all` to pull in the
+transitively-used `hellohq:plugin/types` interface), so the WIT stays
+single-source.
+
+Same toolchain as above (`wasm32-unknown-unknown` target + `wasm-tools`):
+
+```sh
+# from repo root:
+( cd test-guest-inference && cargo build --release --target wasm32-unknown-unknown )
+wasm-tools component new \
+  test-guest-inference/target/wasm32-unknown-unknown/release/inference_guest.wasm \
+  -o tests/fixtures/inference_guest.wasm
+```
+
+`scripts/regen_probe_guest.sh` regenerates all six fixtures.

@@ -110,6 +110,9 @@ interface inference {
 
   record chat-message { role: string, content: string }   // role: system|user|assistant
   record inference-opts { max-tokens: u32, temperature: option<f32> }
+  // usage/model counts (input/output tokens, model id) are a deferred follow-on;
+  // `complete` now STREAMS token-delta strings. Each `stream<string>` element is
+  // one UTF-8 token delta; the guest concatenates them.
   record inference-response {
     content: string,
     input-tokens: u32,
@@ -117,8 +120,11 @@ interface inference {
     model: string,       // model actually used (from user config); never the key
   }
 
+  // STREAMING completion: the host routes the constrained request through the
+  // gated HQAuthProxy (P3 v2 transport) and streams the model's token deltas
+  // back as `stream<string>` elements. Gate denial / parse failure → `api-error`.
   complete: func(messages: list<chat-message>, opts: inference-opts)
-    -> result<inference-response, api-error>;
+    -> result<stream<string>, api-error>;
 }
 
 // ── Plugin exports ────────────────────────────────────────────────────────────
@@ -150,4 +156,17 @@ world plugin {
   //   import wasi:clocks/monotonic-clock@0.3.0;
 
   export guest;
+}
+
+// ── Guest-side world for the ai:inference streaming end-to-end test ───────────
+// Mirrors `http-guest` (in wit-wasi/world.wit). A guest built against this
+// imports `hellohq:plugin/inference` (and transitively `hellohq:plugin/types`),
+// calls `inference.complete([{role:"user", content:"hello"}], {max-tokens:64})`,
+// drains the returned `stream<string>` concatenating the token deltas, and
+// returns the concatenation as bytes via the async `run` export. `run` is
+// `async func` because it awaits the concurrent `complete` import and drains the
+// stream — both yield, so the export task must be async.
+world inference-guest {
+  import inference;
+  export run: async func() -> list<u8>;
 }

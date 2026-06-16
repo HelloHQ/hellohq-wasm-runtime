@@ -53,3 +53,18 @@ wasm-tools component new "$POST_CORE" -o "$POST_OUT"
 
 echo "Wrote $POST_OUT"
 wasm-tools component wit "$POST_OUT"
+
+# ai:inference streaming guest (inference-guest world in wit/world.wit): imports
+# ONLY hellohq:plugin/{inference,types}, exports `run` which calls
+# inference.complete([{role:"user",content:"hello"}], {max-tokens:64}), drains
+# the returned stream<string> concatenating the token deltas, and returns the
+# concatenation as bytes. Isolated crate test-guest-inference. Drives the
+# streaming inference test (tests/inference_complete.rs).
+INFER_CORE="test-guest-inference/target/wasm32-unknown-unknown/release/inference_guest.wasm"
+INFER_OUT="tests/fixtures/inference_guest.wasm"
+
+( cd test-guest-inference && cargo build --release --target wasm32-unknown-unknown )
+wasm-tools component new "$INFER_CORE" -o "$INFER_OUT"
+
+echo "Wrote $INFER_OUT"
+wasm-tools component wit "$INFER_OUT"
