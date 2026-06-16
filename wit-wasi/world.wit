@@ -6,3 +6,18 @@ package hellohq:http-probe;
 world http-probe {
   import wasi:http/handler@0.3.0-rc-2026-01-06;
 }
+
+// Guest-side world for the STAGE 3 end-to-end test. A guest built against this
+// imports wasi:http/{types,handler} — it constructs a request (GET example.com/),
+// calls handler.handle, reads the response status + body — and exports `run`
+// returning the body bytes so the host test can assert the synthesized echo
+// ("GET example.com/"). The guest pulls in wasi:clocks/types transitively (the
+// `duration` used by request-options); the host satisfies it (empty Host impl).
+world http-guest {
+  import wasi:http/types@0.3.0-rc-2026-01-06;
+  import wasi:http/handler@0.3.0-rc-2026-01-06;
+  // `run` is `async func` because the guest awaits the async `handler.handle`
+  // import and drains the response body stream — both yield, so the export task
+  // must be async (a sync export traps with "cannot block a synchronous task").
+  export run: async func() -> list<u8>;
+}

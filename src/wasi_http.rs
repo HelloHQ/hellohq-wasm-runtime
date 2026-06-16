@@ -1,26 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
-//! STAGE 1 of a hand-built `wasi:http@0.3-rc` host: the **resource host
-//! scaffolding**. An in-memory implementation of the `bindgen!`-generated host
-//! traits that COMPILES (`add_to_linker` links) and unit-tests the
-//! non-streaming surface (method / headers / status / options).
+//! A hand-built `wasi:http@0.3-rc` host. STAGE 1 built the resource host
+//! scaffolding (the non-streaming surface: method / headers / status /
+//! options); STAGE 3 (this file's current state) lands the **working streaming
+//! core + `handler::handle`**, proven end-to-end against a real guest component
+//! (`tests/http_handle.rs`).
 //!
-//! The streaming body methods (`request::new` / `response::new` /
-//! `consume_body`) and the async `handler::handle` are deliberately STUBBED in
-//! this stage — see the `// STAGE 3: streaming` markers. The streaming core
-//! (real `StreamReader<u8>` / `FutureReader<…>` bodies routed through the P3
-//! round-trip to Dart's gated fetch) lands in a later stage.
+//! - The four stream-minting methods (`request::new` / `response::new` /
+//!   `request::consume_body` / `response::consume_body`) are SYNC WIT funcs that
+//!   nonetheless mint `stream<u8>` / `future<…>` values. They're flagged `store`
+//!   in `bindgen!` (NOT `async` — see the filter strings below) so they receive
+//!   a `wasmtime::component::Access` (a scoped store borrow) in place of `&mut
+//!   self`, letting them mint streams via `StreamReader::new`.
+//! - `handler::handle` is `async func` in the WIT → already concurrent
+//!   (`Accessor`-based). STAGE 3 synthesizes the response IN-PROCESS: status
+//!   200, an `x-hellohq: ok` header, and a body echoing `"{method}
+//!   {authority}{path}"`. STAGE 4 replaces the synthetic response with a real
+//!   P3 round-trip to Dart's gated fetch.
 //!
-//! Feasibility was proven by the earlier `wasi_http_probe` module (this file is
-//! its successor): `bindgen!` over the vendored `wit-wasi/` world compiles on
-//! Wasmtime 45. Gated behind the `wasi-http` feature (via the `mod` decl in
-//! `lib.rs`); not part of normal builds.
+//! Requires `Config::concurrency_support(true)` (to mint streams/futures).
+//! Gated behind the `wasi-http` feature (via the `mod` decl in `lib.rs`); not
+//! part of normal builds.
 
 use std::collections::HashMap;
 
 wasmtime::component::bindgen!({
     path: "wit-wasi",
     world: "http-probe",
-    imports: { default: async },
+    imports: {
+        "wasi:http/types@0.3.0-rc-2026-01-06.[static]request.new": store,
+        "wasi:http/types@0.3.0-rc-2026-01-06.[static]request.consume-body": store,
+        "wasi:http/types@0.3.0-rc-2026-01-06.[static]response.new": store,
+        "wasi:http/types@0.3.0-rc-2026-01-06.[static]response.consume-body": store,
+        default: async,
+    },
 });
 
 // Pull the generated types into scope. The generated module tree is
@@ -89,9 +101,16 @@ impl FieldsData {
     }
 }
 
-/// Backing state for a `request` resource. STAGE-1 stores only the
-/// non-streaming metadata; the body stream + trailers future are not retained
-/// (STAGE 3 will wire them through the P3 round-trip).
+/// The trailers future shape shared by `request`/`response`:
+/// `future<result<option<trailers>, error-code>>`.
+type TrailersFuture = wasmtime::component::FutureReader<
+    Result<Option<wasmtime::component::Resource<Fields>>, ErrorCode>,
+>;
+
+/// Backing state for a `request` resource. STAGE 3 additionally stashes the
+/// incoming body stream + trailers future minted by the guest in `request::new`,
+/// so `consume_body` can hand them back (the host echo path reads metadata, not
+/// the body — STAGE 4's P3 transport will consume the real stream).
 #[derive(Debug, Default)]
 struct RequestData {
     method: MethodOwned,
@@ -102,13 +121,24 @@ struct RequestData {
     headers: u32,
     /// rep of the optional backing `request-options`, if any.
     options: Option<u32>,
+    /// The incoming body content stream (`none` = zero-length body), stashed in
+    /// `request::new` and handed back by `consume_body`.
+    body: Option<wasmtime::component::StreamReader<u8>>,
+    /// The incoming trailers future, stashed in `request::new`.
+    trailers: Option<TrailersFuture>,
 }
 
-/// Backing state for a `response` resource (non-streaming portion).
+/// Backing state for a `response` resource. STAGE 3 stashes the body stream +
+/// trailers future so `consume_body` can return them (the guest reads the
+/// synthesized response body the host minted in `handler::handle`).
 #[derive(Debug)]
 struct ResponseData {
     status_code: StatusCode,
     headers: u32,
+    /// The response body content stream (`none` = zero-length body).
+    body: Option<wasmtime::component::StreamReader<u8>>,
+    /// The response trailers future.
+    trailers: Option<TrailersFuture>,
 }
 
 /// Backing state for a `request-options` resource: the three optional timeouts.
@@ -421,47 +451,6 @@ impl wasi::http::types::HostFields for WasiHttpHost {
 // ─── wasi::http::types::HostRequest ──────────────────────────────────────────
 
 impl wasi::http::types::HostRequest for WasiHttpHost {
-    // STAGE 3: streaming. `contents` (the body `stream<u8>`) and `trailers`
-    // (the trailers `future`) are accepted but NOT retained or consumed here —
-    // STAGE 3 wires them through the P3 round-trip. We store only the headers +
-    // options metadata, and return a trailers/result future that this stage
-    // cannot construct without a store, so we hand back a never-resolving
-    // placeholder via the streaming stub path. To keep `add_to_linker` linking
-    // without a store handle, the returned result-future is produced by
-    // `todo!()` — replaced in STAGE 3.
-    async fn new(
-        &mut self,
-        headers: wasmtime::component::Resource<Fields>,
-        contents: Option<wasmtime::component::StreamReader<u8>>,
-        trailers: wasmtime::component::FutureReader<
-            Result<Option<wasmtime::component::Resource<Fields>>, ErrorCode>,
-        >,
-        options: Option<wasmtime::component::Resource<RequestOptions>>,
-    ) -> (
-        wasmtime::component::Resource<Request>,
-        wasmtime::component::FutureReader<Result<(), ErrorCode>>,
-    ) {
-        // Record the non-streaming metadata so getters round-trip.
-        let data = RequestData {
-            headers: headers.rep(),
-            options: options.as_ref().map(|o| o.rep()),
-            ..Default::default()
-        };
-        let rep = self.requests.insert(data);
-        let _request = wasmtime::component::Resource::<Request>::new_own(rep);
-
-        // STAGE 3: streaming. Drop the body stream + trailers future for now
-        // (we cannot consume them without a `Store`/`Accessor`, which the host
-        // trait signature does not provide here).
-        let _ = contents;
-        let _ = trailers;
-
-        // STAGE 3: streaming. The transmission-result `future<result>` requires
-        // a store to construct (`FutureReader::new` takes one). Not available in
-        // this `&mut self` method, so this is deferred to STAGE 3.
-        todo!("STAGE 3: request::new transmission-result future requires a store/Accessor")
-    }
-
     async fn get_method(&mut self, self_: wasmtime::component::Resource<Request>) -> Method {
         self.requests
             .get(self_.rep())
@@ -586,62 +575,98 @@ impl wasi::http::types::HostRequest for WasiHttpHost {
         wasmtime::component::Resource::new_own(hdr_rep)
     }
 
-    async fn consume_body(
-        &mut self,
-        this: wasmtime::component::Resource<Request>,
-        res: wasmtime::component::FutureReader<Result<(), ErrorCode>>,
-    ) -> (
-        wasmtime::component::StreamReader<u8>,
-        wasmtime::component::FutureReader<
-            Result<Option<wasmtime::component::Resource<Fields>>, ErrorCode>,
-        >,
-    ) {
-        // STAGE 3: streaming. Returning an immediately-empty body stream + a
-        // ready trailers future both require a `Store`/`Accessor` to build
-        // (`StreamReader::new` / `FutureReader::new` take one), which this
-        // `&mut self` method does not get. Deferred to the streaming stage.
-        let _ = this;
-        let _ = res;
-        todo!(
-            "STAGE 3: request::consume_body empty stream/trailers future requires a store/Accessor"
-        )
-    }
-
     async fn drop(&mut self, rep: wasmtime::component::Resource<Request>) -> wasmtime::Result<()> {
         self.requests.remove(rep.rep());
         Ok(())
     }
 }
 
+// ─── wasi::http::types::HostRequestWithStore — the stream-minting methods ─────
+//
+// `[static]request.new` and `[static]request.consume-body` are SYNC WIT funcs,
+// but they mint `stream<u8>` / `future<...>` values — which need a `Store` (+
+// `Config::concurrency_support`). The `store` bindgen filter (NOT `async`,
+// since the WIT funcs aren't `async func`) gives these a `wasmtime::component::
+// Access` handle in place of `&mut self`: `Access` is a scoped store borrow
+// (`AsContextMut`) plus host-state access (`.get()`), so we can both mint
+// streams (`StreamReader::new(&mut host, …)`) and touch the resource tables.
+// `async | store` would instead generate a *concurrent* (`func_wrap_concurrent`)
+// import whose ASYNC type-flag (`true`) mismatches the sync WIT func's
+// (`false`) — failing instantiation with "type mismatch with async". So `store`
+// alone is the correct flag for these sync-but-stream-minting methods.
+
+impl wasi::http::types::HostRequestWithStore for wasmtime::component::HasSelf<WasiHttpHost> {
+    fn new<T>(
+        mut host: wasmtime::component::Access<T, Self>,
+        headers: wasmtime::component::Resource<Fields>,
+        contents: Option<wasmtime::component::StreamReader<u8>>,
+        trailers: TrailersFuture,
+        options: Option<wasmtime::component::Resource<RequestOptions>>,
+    ) -> (
+        wasmtime::component::Resource<Request>,
+        wasmtime::component::FutureReader<Result<(), ErrorCode>>,
+    ) {
+        // Mint the transmission-result future (it borrows the store); a request
+        // constructed in-process transmits successfully → ready `Ok(())`. The
+        // producer's outer `Result<_, E>` is the host error channel (unused).
+        let transmit = wasmtime::component::FutureReader::new(&mut host, async {
+            Ok::<_, wasmtime::Error>(Ok::<(), ErrorCode>(()))
+        })
+        .expect("concurrency support enabled (Config::concurrency_support(true))");
+
+        // Record metadata + stash the incoming body stream / trailers future so
+        // a later `consume_body` (or STAGE 4's transport) can use them.
+        let state = host.get();
+        let data = RequestData {
+            headers: headers.rep(),
+            options: options.as_ref().map(|o| o.rep()),
+            body: contents,
+            trailers: Some(trailers),
+            ..Default::default()
+        };
+        let rep = state.requests.insert(data);
+        (
+            wasmtime::component::Resource::<Request>::new_own(rep),
+            transmit,
+        )
+    }
+
+    fn consume_body<T>(
+        mut host: wasmtime::component::Access<T, Self>,
+        this: wasmtime::component::Resource<Request>,
+        res: wasmtime::component::FutureReader<Result<(), ErrorCode>>,
+    ) -> (wasmtime::component::StreamReader<u8>, TrailersFuture) {
+        // `res` is the caller's error channel for the body transfer; the
+        // in-process echo path has nothing to signal through it, so discard it.
+        let _ = res;
+
+        // Take any stashed body stream + trailers future out of the request.
+        let (body, trailers) = host
+            .get()
+            .requests
+            .get_mut(this.rep())
+            .map(|r| (r.body.take(), r.trailers.take()))
+            .unwrap_or((None, None));
+
+        // Fall back to an empty body (zero-length) / ready `Ok(None)` trailers
+        // when the request carried none.
+        let body = body.unwrap_or_else(|| {
+            wasmtime::component::StreamReader::new(&mut host, Vec::<u8>::new())
+                .expect("concurrency support enabled")
+        });
+        let trailers = trailers.unwrap_or_else(|| {
+            wasmtime::component::FutureReader::new(&mut host, async {
+                Ok::<_, wasmtime::Error>(Ok::<_, ErrorCode>(None))
+            })
+            .expect("concurrency support enabled")
+        });
+        (body, trailers)
+    }
+}
+
 // ─── wasi::http::types::HostResponse ─────────────────────────────────────────
 
 impl wasi::http::types::HostResponse for WasiHttpHost {
-    async fn new(
-        &mut self,
-        headers: wasmtime::component::Resource<Fields>,
-        contents: Option<wasmtime::component::StreamReader<u8>>,
-        trailers: wasmtime::component::FutureReader<
-            Result<Option<wasmtime::component::Resource<Fields>>, ErrorCode>,
-        >,
-    ) -> (
-        wasmtime::component::Resource<Response>,
-        wasmtime::component::FutureReader<Result<(), ErrorCode>>,
-    ) {
-        // Record the non-streaming metadata (default status 200, per the WIT).
-        let data = ResponseData {
-            status_code: 200,
-            headers: headers.rep(),
-        };
-        let rep = self.responses.insert(data);
-        let _response = wasmtime::component::Resource::<Response>::new_own(rep);
-
-        // STAGE 3: streaming. Body stream + trailers future not retained yet.
-        let _ = contents;
-        let _ = trailers;
-        // STAGE 3: streaming. The transmission-result future needs a store.
-        todo!("STAGE 3: response::new transmission-result future requires a store/Accessor")
-    }
-
     async fn get_status_code(
         &mut self,
         self_: wasmtime::component::Resource<Response>,
@@ -685,25 +710,68 @@ impl wasi::http::types::HostResponse for WasiHttpHost {
         wasmtime::component::Resource::new_own(hdr_rep)
     }
 
-    async fn consume_body(
-        &mut self,
-        this: wasmtime::component::Resource<Response>,
-        res: wasmtime::component::FutureReader<Result<(), ErrorCode>>,
-    ) -> (
-        wasmtime::component::StreamReader<u8>,
-        wasmtime::component::FutureReader<
-            Result<Option<wasmtime::component::Resource<Fields>>, ErrorCode>,
-        >,
-    ) {
-        // STAGE 3: streaming. Same store/Accessor limitation as request::consume_body.
-        let _ = this;
-        let _ = res;
-        todo!("STAGE 3: response::consume_body empty stream/trailers future requires a store/Accessor")
-    }
-
     async fn drop(&mut self, rep: wasmtime::component::Resource<Response>) -> wasmtime::Result<()> {
         self.responses.remove(rep.rep());
         Ok(())
+    }
+}
+
+// ─── wasi::http::types::HostResponseWithStore — stream-minting methods ────────
+
+impl wasi::http::types::HostResponseWithStore for wasmtime::component::HasSelf<WasiHttpHost> {
+    fn new<T>(
+        mut host: wasmtime::component::Access<T, Self>,
+        headers: wasmtime::component::Resource<Fields>,
+        contents: Option<wasmtime::component::StreamReader<u8>>,
+        trailers: TrailersFuture,
+    ) -> (
+        wasmtime::component::Resource<Response>,
+        wasmtime::component::FutureReader<Result<(), ErrorCode>>,
+    ) {
+        let transmit = wasmtime::component::FutureReader::new(&mut host, async {
+            Ok::<_, wasmtime::Error>(Ok::<(), ErrorCode>(()))
+        })
+        .expect("concurrency support enabled (Config::concurrency_support(true))");
+
+        let state = host.get();
+        let data = ResponseData {
+            status_code: 200,
+            headers: headers.rep(),
+            body: contents,
+            trailers: Some(trailers),
+        };
+        let rep = state.responses.insert(data);
+        (
+            wasmtime::component::Resource::<Response>::new_own(rep),
+            transmit,
+        )
+    }
+
+    fn consume_body<T>(
+        mut host: wasmtime::component::Access<T, Self>,
+        this: wasmtime::component::Resource<Response>,
+        res: wasmtime::component::FutureReader<Result<(), ErrorCode>>,
+    ) -> (wasmtime::component::StreamReader<u8>, TrailersFuture) {
+        // `res` (caller error channel) is unused on the in-process echo path.
+        let _ = res;
+        let (body, trailers) = host
+            .get()
+            .responses
+            .get_mut(this.rep())
+            .map(|r| (r.body.take(), r.trailers.take()))
+            .unwrap_or((None, None));
+
+        let body = body.unwrap_or_else(|| {
+            wasmtime::component::StreamReader::new(&mut host, Vec::<u8>::new())
+                .expect("concurrency support enabled")
+        });
+        let trailers = trailers.unwrap_or_else(|| {
+            wasmtime::component::FutureReader::new(&mut host, async {
+                Ok::<_, wasmtime::Error>(Ok::<_, ErrorCode>(None))
+            })
+            .expect("concurrency support enabled")
+        });
+        (body, trailers)
     }
 }
 
@@ -820,15 +888,78 @@ impl wasi::http::handler::Host for WasiHttpHost {}
 
 impl wasi::http::handler::HostWithStore for wasmtime::component::HasSelf<WasiHttpHost> {
     async fn handle<T: Send>(
-        _accessor: &wasmtime::component::Accessor<T, Self>,
-        _request: wasmtime::component::Resource<Request>,
+        accessor: &wasmtime::component::Accessor<T, Self>,
+        request: wasmtime::component::Resource<Request>,
     ) -> Result<wasmtime::component::Resource<Response>, ErrorCode> {
-        // STAGE 3: streaming. The real outbound fetch is routed app-side
-        // (gated) via the P3 round-trip and constructs the response from a
-        // body stream. Until then, return a clean, non-panicking error.
-        Err(ErrorCode::InternalError(Some(
-            "wasi:http handler not yet implemented (STAGE 3)".to_string(),
-        )))
+        // STAGE 3: synthesize the response IN-PROCESS (no network, no P3 yet).
+        // We read the request's metadata + headers from the host resource state
+        // and echo a one-line summary back as the 200 response body. STAGE 4
+        // replaces this synthetic response with a real P3 round-trip to Dart.
+        accessor.with(|mut access| {
+            let host = access.get();
+
+            // Read the request metadata. Treat a missing request as an internal
+            // error (the guest passed a stale/foreign handle).
+            let Some(req) = host.requests.get(request.rep()) else {
+                return Err(ErrorCode::InternalError(Some(
+                    "wasi:http handler: unknown request resource".to_string(),
+                )));
+            };
+            let method = method_str(&req.method);
+            let authority = req.authority.clone().unwrap_or_default();
+            let path = req
+                .path_with_query
+                .clone()
+                .unwrap_or_else(|| "/".to_string());
+
+            // Echo summary body: e.g. "GET example.com/".
+            let summary = format!("{method} {authority}{path}");
+            let body_bytes = summary.into_bytes();
+
+            // Build the response headers as a fresh `fields` carrying our marker.
+            let resp_headers = FieldsData {
+                entries: vec![("x-hellohq".to_string(), b"ok".to_vec())],
+                immutable: false,
+            };
+            let headers_rep = host.fields.insert(resp_headers);
+
+            // Mint the response body stream from the echoed `Vec<u8>` (the
+            // provided `StreamProducer for Vec<u8>` buffered-body path) and a
+            // ready `Ok(None)` trailers future.
+            let body = wasmtime::component::StreamReader::new(&mut access, body_bytes)
+                .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))?;
+            let trailers: TrailersFuture =
+                wasmtime::component::FutureReader::new(&mut access, async {
+                    Ok::<_, wasmtime::Error>(Ok::<_, ErrorCode>(None))
+                })
+                .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))?;
+
+            // Construct the response resource (status 200 + headers + body).
+            let host = access.get();
+            let rep = host.responses.insert(ResponseData {
+                status_code: 200,
+                headers: headers_rep,
+                body: Some(body),
+                trailers: Some(trailers),
+            });
+            Ok(wasmtime::component::Resource::<Response>::new_own(rep))
+        })
+    }
+}
+
+/// Stable string form of a `MethodOwned` for the echo summary.
+fn method_str(m: &MethodOwned) -> &str {
+    match m {
+        MethodOwned::Get => "GET",
+        MethodOwned::Head => "HEAD",
+        MethodOwned::Post => "POST",
+        MethodOwned::Put => "PUT",
+        MethodOwned::Delete => "DELETE",
+        MethodOwned::Connect => "CONNECT",
+        MethodOwned::Options => "OPTIONS",
+        MethodOwned::Trace => "TRACE",
+        MethodOwned::Patch => "PATCH",
+        MethodOwned::Other(s) => s,
     }
 }
 
@@ -1035,6 +1166,8 @@ mod tests {
             let resp_rep = host.responses.insert(ResponseData {
                 status_code: 200,
                 headers: hdr,
+                body: None,
+                trailers: None,
             });
             let resp = || wasmtime::component::Resource::<Response>::new_own(resp_rep);
 

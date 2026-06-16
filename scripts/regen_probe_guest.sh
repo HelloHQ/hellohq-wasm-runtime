@@ -26,3 +26,16 @@ wasm-tools component new "$P3_CORE" -o "$P3_OUT"
 
 echo "Wrote $P3_OUT"
 wasm-tools component wit "$P3_OUT"
+
+# STAGE 3 wasi:http guest (http-guest world in wit-wasi): imports ONLY
+# wasi:http/{types,handler}, exports `run` which builds a GET request, calls
+# handler.handle, and returns the response status + body. Isolated crate
+# test-guest-http. Drives the STAGE 3 end-to-end test (tests/http_handle.rs).
+HTTP_CORE="test-guest-http/target/wasm32-unknown-unknown/release/http_guest.wasm"
+HTTP_OUT="tests/fixtures/http_guest.wasm"
+
+( cd test-guest-http && cargo build --release --target wasm32-unknown-unknown )
+wasm-tools component new "$HTTP_CORE" -o "$HTTP_OUT"
+
+echo "Wrote $HTTP_OUT"
+wasm-tools component wit "$HTTP_OUT"

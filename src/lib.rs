@@ -42,9 +42,12 @@
 // STAGE 1 scaffolding: the host state + trait impls are exercised by the
 // module's own unit tests and consumed by later stages (the C ABI wiring lands
 // when streaming does). Until then the non-test build sees them as unused.
+// `pub` so the STAGE 3 end-to-end integration test (tests/http_handle.rs) can
+// reach `WasiHttpHost`; the C ABI wiring (and a narrower surface) lands when the
+// P3 transport does in STAGE 4.
 #[cfg(feature = "wasi-http")]
 #[allow(dead_code)]
-mod wasi_http;
+pub mod wasi_http;
 
 pub const HWR_ABI_VERSION: u32 = 1;
 

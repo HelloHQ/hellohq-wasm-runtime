@@ -17,3 +17,4 @@ ios-bench/Resources/*.cwasm
 # Guest fixture crate build output (regenerate via scripts/regen_probe_guest.sh)
 /test-guest/target
 /test-guest-p3/target
+/test-guest-http/target
