@@ -1037,6 +1037,16 @@ async fn handle_via_transport<T: Send>(
             head.push_str(": ");
             head.push_str(&String::from_utf8_lossy(value));
         }
+        // Surface the request's `request-options` timeouts to the caller (which
+        // enforces them; the host has no timer) as a reserved head line.
+        let options_line = req
+            .options
+            .and_then(|rep| host.options.get(rep))
+            .and_then(format_request_options_line);
+        if let Some(line) = options_line {
+            head.push('\n');
+            head.push_str(&line);
+        }
 
         // Take the stashed request-body stream out (so we can stream it OUT) and
         // the inbound receiver out (so we can await it without the borrow).
@@ -1118,15 +1128,20 @@ async fn handle_via_transport<T: Send>(
         )))
     })?;
     let mut resp_header_entries: Vec<(String, Vec<u8>)> = Vec::new();
+    // Trailer fields the caller reported on the reserved head line, if any.
+    let mut resp_trailer_entries: Option<Vec<(String, FieldValue)>> = None;
     for line in lines {
         if line.is_empty() {
             continue;
         }
         if let Some((name, value)) = line.split_once(':') {
-            resp_header_entries.push((
-                name.trim().to_string(),
-                value.trim_start().as_bytes().to_vec(),
-            ));
+            let name = name.trim();
+            let value = value.trim_start();
+            if name.eq_ignore_ascii_case(TRAILERS_HEAD_KEY) {
+                resp_trailer_entries = Some(parse_trailers_line(value));
+            } else {
+                resp_header_entries.push((name.to_string(), value.as_bytes().to_vec()));
+            }
         }
     }
 
@@ -1142,13 +1157,26 @@ async fn handle_via_transport<T: Send>(
             immutable: false,
         });
 
+        // If the caller reported trailers, back them with an immutable `fields`
+        // resource and resolve the trailers future with `Ok(Some(..))`; else
+        // resolve `Ok(None)` (the prior, no-trailers behaviour).
+        let trailers_rep: Option<u32> = resp_trailer_entries.map(|entries| {
+            host.fields.insert(FieldsData {
+                entries,
+                immutable: true,
+            })
+        });
+
         let body =
             wasmtime::component::StreamReader::new(&mut access, ResponseBodyProducer { inbound })
                 .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))?;
-        let trailers: TrailersFuture = wasmtime::component::FutureReader::new(&mut access, async {
-            Ok::<_, wasmtime::Error>(Ok::<_, ErrorCode>(None))
-        })
-        .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))?;
+        let trailers: TrailersFuture =
+            wasmtime::component::FutureReader::new(&mut access, async move {
+                Ok::<_, wasmtime::Error>(Ok::<_, ErrorCode>(
+                    trailers_rep.map(wasmtime::component::Resource::new_own),
+                ))
+            })
+            .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))?;
 
         let host = access.get();
         let rep = host.responses.insert(ResponseData {
@@ -1280,6 +1308,86 @@ fn method_str(m: &MethodOwned) -> &str {
         MethodOwned::Patch => "PATCH",
         MethodOwned::Other(s) => s,
     }
+}
+
+// ─── Transport head-frame extensions: request options + response trailers ────
+//
+// The P3 transport frames a request OUT (head + body) to the gated caller
+// (Dart's fetch) and frames the response back IN (head + body). The head is a
+// `\n`-separated set of `name: value` lines. Two `wasi:http@0.3-rc` features
+// ride that head as reserved lines, so no new frame type / Dart-side signal is
+// needed and a caller that ignores them degrades to the prior behaviour:
+//
+//   * REQUEST OPTIONS (OUT head): the request's `request-options` timeouts are
+//     SURFACED to the caller, which OWNS enforcement — the in-process executor
+//     has no timer, so the host cannot enforce wall-clock timeouts itself.
+//   * RESPONSE TRAILERS (IN head): the caller reports the upstream response's
+//     trailers, which the host resolves the response trailers future with
+//     (instead of the prior hard-coded `Ok(None)`).
+
+/// Reserved OUT head line carrying the request's timeouts (nanoseconds) for the
+/// caller to enforce: `x-hellohq-request-options: connect=<ns>;first-byte=<ns>;
+/// between-bytes=<ns>` (only the set timeouts appear). `None` when none is set.
+const REQUEST_OPTIONS_HEAD_KEY: &str = "x-hellohq-request-options";
+
+/// Reserved IN head line carrying response trailer fields:
+/// `x-hellohq-trailers: <name>=<hex(value)>;...`. Values are hex-encoded so
+/// arbitrary bytes survive the `;`/`=`/`\n`-delimited head framing.
+const TRAILERS_HEAD_KEY: &str = "x-hellohq-trailers";
+
+/// Format the [`REQUEST_OPTIONS_HEAD_KEY`] line for `opts`, or `None` if no
+/// timeout is set (so no line is emitted). `Duration` is `u64` nanoseconds.
+fn format_request_options_line(opts: &RequestOptionsData) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(ns) = opts.connect_timeout {
+        parts.push(format!("connect={ns}"));
+    }
+    if let Some(ns) = opts.first_byte_timeout {
+        parts.push(format!("first-byte={ns}"));
+    }
+    if let Some(ns) = opts.between_bytes_timeout {
+        parts.push(format!("between-bytes={ns}"));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("{REQUEST_OPTIONS_HEAD_KEY}: {}", parts.join(";")))
+}
+
+/// Parse the [`TRAILERS_HEAD_KEY`] line value (`<name>=<hex>;...`) into trailer
+/// field entries. Malformed pairs (no `=`, bad hex) are skipped.
+fn parse_trailers_line(value: &str) -> Vec<(String, FieldValue)> {
+    let mut out = Vec::new();
+    for pair in value.split(';') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some((name, hex)) = pair.split_once('=') {
+            if let Some(bytes) = hex_decode(hex.trim()) {
+                out.push((name.trim().to_string(), bytes));
+            }
+        }
+    }
+    out
+}
+
+/// Decode a lowercase/uppercase hex string to bytes; `None` on odd length or a
+/// non-hex digit.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    if !b.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(b.len() / 2);
+    let mut i = 0;
+    while i < b.len() {
+        let hi = (b[i] as char).to_digit(16)?;
+        let lo = (b[i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Some(out)
 }
 
 // ─── Unit tests (non-streaming surface) ──────────────────────────────────────
@@ -1587,5 +1695,61 @@ mod tests {
         let engine = wasmtime::Engine::new(&cfg).unwrap();
         let mut linker = wasmtime::component::Linker::<WasiHttpHost>::new(&engine);
         WasiHttpHost::add_to_linker(&mut linker).expect("add_to_linker must link");
+    }
+
+    // ── Transport head-frame extensions (pure helpers) ───────────────────────
+
+    #[test]
+    fn request_options_line_omits_unset_and_emits_set() {
+        // No timeout set → no line at all.
+        assert_eq!(
+            format_request_options_line(&RequestOptionsData::default()),
+            None
+        );
+        // Only the set timeouts appear, in nanoseconds, in order.
+        let opts = RequestOptionsData {
+            connect_timeout: Some(1_000),
+            between_bytes_timeout: Some(3_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_request_options_line(&opts).as_deref(),
+            Some("x-hellohq-request-options: connect=1000;between-bytes=3000")
+        );
+        // All three set.
+        let all = RequestOptionsData {
+            connect_timeout: Some(1),
+            first_byte_timeout: Some(2),
+            between_bytes_timeout: Some(3),
+            immutable: false,
+        };
+        assert_eq!(
+            format_request_options_line(&all).as_deref(),
+            Some("x-hellohq-request-options: connect=1;first-byte=2;between-bytes=3")
+        );
+    }
+
+    #[test]
+    fn trailers_line_roundtrips_via_hex() {
+        // hex decode basics + binary-safety (a value with ';' and '=').
+        assert_eq!(hex_decode("00ff"), Some(vec![0x00, 0xff]));
+        assert_eq!(hex_decode("0"), None); // odd length
+        assert_eq!(hex_decode("zz"), None); // non-hex
+
+        // "x-checksum" = "a;b=c" (bytes 61 3b 62 3d 63), "trace" = "1".
+        let parsed = parse_trailers_line("x-checksum=613b623d63;trace=31");
+        assert_eq!(
+            parsed,
+            vec![
+                ("x-checksum".to_string(), b"a;b=c".to_vec()),
+                ("trace".to_string(), b"1".to_vec()),
+            ]
+        );
+        // Malformed pairs are skipped; empty input → no entries.
+        assert!(parse_trailers_line("").is_empty());
+        assert_eq!(
+            parse_trailers_line("good=31;nobad;odd=1"),
+            vec![("good".to_string(), b"1".to_vec())]
+        );
     }
 }
