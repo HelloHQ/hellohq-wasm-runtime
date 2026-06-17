@@ -160,15 +160,23 @@ fn js_guest_denied_gate_chokepoint() {
     let wasm = std::fs::read(&path).expect("read JS guest component");
     let out = run_js_plugin_blocking(&wasm, false).expect("denied run still instantiates + runs");
 
-    // The gate denied the workspace read (the chokepoint held). The JS quickstart
-    // does NOT catch the resulting ApiError, so the unhandled JS throw becomes a
-    // wasm trap rather than a WIT `Err` (the Go/Rust guests `return … err`). Either
-    // way the run does NOT succeed, and nothing downstream of the denied read fired.
-    let succeeded = matches!(out.run_result, Ok(Ok(_)));
+    // The gate denied the workspace read (the chokepoint held). jco does NOT map
+    // an uncaught throw to the WIT `Err` (it traps the guest), so the JS
+    // quickstart CATCHES the ApiError and RETURNS a degraded "denied:<message>"
+    // summary instead — graceful degradation, no trap — and nothing downstream
+    // of the denied read (storage/events) fired.
+    let inner = out
+        .run_result
+        .expect("denied run must return (not trap) — the guest catches the ApiError");
+    let summary = inner.expect("the guest returns Ok with a degraded summary");
+    let text = String::from_utf8_lossy(&summary);
     assert!(
-        !succeeded,
-        "denied run must not succeed, got {:?}",
-        out.run_result
+        text.starts_with("denied:"),
+        "expected a 'denied:<message>' degraded summary, got {text:?}"
+    );
+    assert!(
+        text.contains("capability not granted") || text.contains("permission"),
+        "expected the gate-denial message in the summary, got {text:?}"
     );
     assert!(out.stored_greeting.is_none());
     assert!(out.events.is_empty());
