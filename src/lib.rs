@@ -70,6 +70,17 @@ pub mod inference;
 #[allow(dead_code)]
 pub mod storage_events;
 
+// The end-to-end capstone host harness: ONE host struct backing the full
+// `capstone-host` world (workspace + storage + events + log), whose import set
+// matches the SDK-authored quickstart component's tree-shaken imports exactly.
+// Composes `storage_events::StorageEventsHost` for storage/events. Behind the
+// same `wasi-http` feature, so default / `--no-default-features` builds are
+// unaffected. Drives tests/capstone.rs (the SDK → component → runtime → host
+// proof on the real fixture component).
+#[cfg(feature = "wasi-http")]
+#[allow(dead_code)]
+pub mod capstone;
+
 pub const HWR_ABI_VERSION: u32 = 1;
 
 // In-process Wasm compilation/execution requires Cranelift and is available only

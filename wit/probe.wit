@@ -40,3 +40,25 @@ world storage-events-guest {
   import events;
   export run: func() -> list<u8>;
 }
+
+// Capstone host world (same hellohq:plugin package) for the end-to-end SDK →
+// component → runtime → host proof (tests/capstone.rs). It is the HOST side: it
+// imports exactly the four SYNC capability interfaces an SDK-authored plugin
+// tree-shakes down to — `workspace` + `storage` + `events` + `log` (and,
+// transitively, the type-only `types`) — and exports the canonical `guest`
+// interface the plugin provides (`init`/`run`/`metadata`).
+//
+// This import set MUST match the example component's imports (verified via
+// `wasm-tools component wit` on the fixture): the host's `add_to_linker` over
+// this world satisfies the component's imports exactly, so instantiation
+// succeeds. `inference` is deliberately NOT imported: the canonical `guest.run`
+// is SYNC, but `inference.complete` streams and needs an async `run` — so the
+// SDK quickstart (and this capstone) cover only the four sync capabilities.
+// Inference is proven end-to-end separately (`inference-guest`/inference.rs).
+world capstone-host {
+  import workspace;
+  import storage;
+  import events;
+  import log;
+  export guest;
+}

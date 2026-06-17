@@ -51,6 +51,10 @@ wasmtime::component::bindgen!({
 use hellohq::plugin::events::PluginEvent;
 use hellohq::plugin::types::ApiError;
 
+/// Public re-export of this world's generated `api-error`, so a composing host
+/// (the capstone) can name the type when re-packing errors across worlds.
+pub use hellohq::plugin::types::ApiError as ApiErrorAlias;
+
 /// Per-plugin storage quota: at most this many keys.
 pub const STORAGE_MAX_KEYS: usize = 128;
 /// Per-plugin storage quota: at most this many total value bytes across all keys.
@@ -86,6 +90,47 @@ impl StorageEventsHost {
     /// The events the demo sink captured, in emit order (test inspection point).
     pub fn captured_events(&self) -> &[PluginEvent] {
         &self.events
+    }
+
+    /// Read a stored value straight off the backing KV, bypassing the gate — a
+    /// host-side inspection point so a test can assert what a (granted) plugin
+    /// persisted without re-checking the permission flag.
+    pub fn stored_value(&self, key: &str) -> Option<&Vec<u8>> {
+        self.kv.get(key)
+    }
+
+    /// Storage `get` (gated KV read), exposed so a composing host (the capstone)
+    /// can delegate its `storage::Host::get` here verbatim.
+    pub fn kv_get(&mut self, key: String) -> Result<Option<Vec<u8>>, ApiError> {
+        <Self as hellohq::plugin::storage::Host>::get(self, key)
+    }
+
+    /// Storage `set` (gated KV write + quotas), delegation point for composers.
+    pub fn kv_set(&mut self, key: String, value: Vec<u8>) -> Result<(), ApiError> {
+        <Self as hellohq::plugin::storage::Host>::set(self, key, value)
+    }
+
+    /// Storage `delete` (gated), delegation point for composers.
+    pub fn kv_delete(&mut self, key: String) -> Result<(), ApiError> {
+        <Self as hellohq::plugin::storage::Host>::delete(self, key)
+    }
+
+    /// Storage `clear` (gated), delegation point for composers.
+    pub fn kv_clear(&mut self) -> Result<(), ApiError> {
+        <Self as hellohq::plugin::storage::Host>::clear(self)
+    }
+
+    /// Storage `list-keys` (gated), delegation point for composers.
+    pub fn kv_list_keys(&mut self) -> Result<Vec<String>, ApiError> {
+        <Self as hellohq::plugin::storage::Host>::list_keys(self)
+    }
+
+    /// Capture an event into the sink under the size + rate caps (always
+    /// grantable), delegation point for a composing host's `events::Host::emit`.
+    /// Takes the event fields raw so a composer can re-pack from ITS own world's
+    /// `plugin-event` type (structurally identical).
+    pub fn capture_event(&mut self, kind: String, payload: Vec<u8>) -> Result<(), ApiError> {
+        <Self as hellohq::plugin::events::Host>::emit(self, PluginEvent { kind, payload })
     }
 
     /// Total value bytes currently stored (quota accounting helper).

@@ -83,3 +83,22 @@ wasm-tools component new "$SE_CORE" -o "$SE_OUT"
 
 echo "Wrote $SE_OUT"
 wasm-tools component wit "$SE_OUT"
+
+# CAPSTONE fixture (capstone_plugin.component.wasm): the real SDK-authored
+# quickstart plugin (plugin-sdk/examples/component-quickstart), NOT a hand-rolled
+# probe. Built with hellohq-plugin-sdk against the canonical hellohq:plugin WIT;
+# tree-shakes down to workspace/storage/events/log (+ types) and exports `guest`.
+# Its own build.sh does the two build steps; we just copy the result in.
+# Drives the end-to-end capstone test (tests/capstone.rs).
+QUICKSTART_DIR="../plugin-sdk/examples/component-quickstart"
+CAPSTONE_BUILT="$QUICKSTART_DIR/component_quickstart.component.wasm"
+CAPSTONE_OUT="tests/fixtures/capstone_plugin.component.wasm"
+
+if [ -d "$QUICKSTART_DIR" ]; then
+  ( cd "$QUICKSTART_DIR" && bash build.sh )
+  cp "$CAPSTONE_BUILT" "$CAPSTONE_OUT"
+  echo "Wrote $CAPSTONE_OUT"
+  wasm-tools component wit "$CAPSTONE_OUT"
+else
+  echo "SKIP: $QUICKSTART_DIR not found; capstone fixture not regenerated" >&2
+fi

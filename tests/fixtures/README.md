@@ -282,3 +282,54 @@ wasm-tools component new \
 ```
 
 `scripts/regen_probe_guest.sh` regenerates all fixtures.
+
+## `capstone_plugin.component.wasm`
+
+The end-to-end **capstone** fixture (`tests/capstone.rs`): a real SDK-authored
+plugin component, NOT a hand-rolled probe guest. It is the `hellohq-plugin-sdk`
+quickstart example (`../../../plugin-sdk/examples/component-quickstart`), built
+with the SDK against the canonical `hellohq:plugin@0.1.0` WIT.
+
+On `guest.run` it logs a banner + progress lines (`hq::log`), reads the workspace
+portfolio names (`hq::workspace`, gated), stores `greeting`="hello" and reads it
+back (`hq::storage`), emits `quickstart-ran`/"ok" (`hq::events`), and returns the
+compact summary `"<n-portfolios>|<roundtrip-ok>"` (e.g. `2|1`). On a gate denial
+of the workspace read the plugin maps the `api-error` into its `run` `Err(String)`.
+
+`wasm-tools component new` tree-shakes the build down to the four sync capability
+imports the plugin actually calls (`workspace.read-portfolio-names`,
+`storage.get`/`set`, `events.emit`, `log.write`) plus the type-only `types`, and
+exports the canonical `guest` interface. NO wasi, NO inference (inference needs
+an async `run` and is proven separately — `inference_guest.wasm`). The host
+harness world (`capstone-host` in `../../wit/probe.wit`) imports exactly this set
+so `CapstoneHarness::add_to_linker` satisfies the component's imports.
+
+Verify imports/exports:
+
+```sh
+wasm-tools component wit tests/fixtures/capstone_plugin.component.wasm
+# import hellohq:plugin/types@0.1.0;
+# import hellohq:plugin/workspace@0.1.0;
+# import hellohq:plugin/storage@0.1.0;
+# import hellohq:plugin/events@0.1.0;
+# import hellohq:plugin/log@0.1.0;
+# export hellohq:plugin/guest@0.1.0;
+```
+
+### Regenerate
+
+Source: the SDK example crate
+`../../../plugin-sdk/examples/component-quickstart/` (its own `[workspace]`
+root). It depends on `hellohq-plugin-sdk` (`../../sdks/rust`) and builds against
+the SDK's vendored canonical WIT (SSOT: `plugin-protocol/wit/`). The example's
+own `build.sh` does the two build steps; the regen step just copies the result
+into the fixture dir:
+
+```sh
+# from repo root:
+( cd ../plugin-sdk/examples/component-quickstart && bash build.sh )
+cp ../plugin-sdk/examples/component-quickstart/component_quickstart.component.wasm \
+  tests/fixtures/capstone_plugin.component.wasm
+```
+
+`scripts/regen_probe_guest.sh` regenerates all fixtures (incl. this one).
