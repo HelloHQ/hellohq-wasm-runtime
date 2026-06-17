@@ -89,7 +89,7 @@ pub mod capstone;
 // backing the gated capabilities. Behind the `wasi-guests` feature (pulls heavy
 // deps: tokio, cap-std), so default / `--no-default-features` (iOS no-JIT) are
 // unaffected. Drives tests/go_guest.rs (a real TinyGo component on the runtime).
-#[cfg(feature = "wasi-guests")]
+#[cfg(any(feature = "wasi-guests", feature = "wasi-guests-measure"))]
 #[allow(dead_code)]
 pub mod wasi_guests;
 
@@ -98,7 +98,7 @@ pub mod wasi_guests;
 // JS/Go guest's `wasi:http@0.2` outbound request reach the real sender. Plain
 // Rust, no Wasmtime types; a faithful port of the hellohq app's
 // `PluginNetworkService`. Behind `wasi-guests` since that is its only consumer.
-#[cfg(feature = "wasi-guests")]
+#[cfg(any(feature = "wasi-guests", feature = "wasi-guests-measure"))]
 pub mod fetch_gate;
 
 pub const HWR_ABI_VERSION: u32 = 1;

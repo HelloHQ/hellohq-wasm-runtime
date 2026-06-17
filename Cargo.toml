@@ -103,6 +103,13 @@ wasi-http = []
 # so the iOS no-JIT size is unaffected — the iOS size / cross-compile of
 # wasmtime-wasi is a deliberate follow-on, not solved here.
 wasi-guests = ["wasi-http", "compile", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http", "dep:hyper", "dep:http-body-util", "dep:bytes"]
+# Size-measurement ONLY: the `wasi-guests` host surface (wasmtime-wasi +
+# wasmtime-wasi-http + the wasi_guests/fetch_gate modules) WITHOUT `compile`
+# (Cranelift/wat). Lets the iOS no-JIT (Pulley) build link the WASI host so we
+# can measure what wasmtime-wasi alone adds, isolated from the JIT. NOT for
+# running guests (instantiating a portable component needs `compile`); the
+# guest tests stay on `wasi-guests`. Out of default — purely a measurement knob.
+wasi-guests-measure = ["wasi-http", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http", "dep:hyper", "dep:http-body-util", "dep:bytes"]
 
 # Examples gated by the features they need, so `cargo build --no-default-features
 # [--examples]` (the iOS no-JIT link check) never tries to compile a Cranelift-only
