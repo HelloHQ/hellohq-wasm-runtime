@@ -333,3 +333,67 @@ cp ../plugin-sdk/examples/component-quickstart/component_quickstart.component.wa
 ```
 
 `scripts/regen_probe_guest.sh` regenerates all fixtures (incl. this one).
+
+## `go_guest.component.wasm`
+
+The **Go SDK quickstart** built with **TinyGo** (`-target=wasip2`) — the proof a
+richer SDK guest, one that embeds a language runtime, runs on the "support all
+WASI generations at once" linker (`tests/go_guest.rs`). It is the
+`plugin-sdk/examples/component-quickstart-go` example.
+
+Unlike the no_std Rust capstone (which tree-shakes to ONLY `hellohq:plugin/*`),
+the TinyGo runtime ALSO imports the `wasi:0.2` surface. So the host must satisfy
+BOTH the four capabilities AND the wasi imports, or instantiation fails. The
+runtime does that on ONE `component::Linker<GoGuestState>` carrying every WASI
+generation:
+
+- **WASI 0.2 runtime** (`wasmtime-wasi@45`, `add_to_linker_async`) — LOCKED DOWN
+  (no preopens/env/network/stdio), so the wasi imports resolve but grant nothing.
+- **WASI 0.2 `wasi:http`** (`wasmtime-wasi-http@45`,
+  `add_only_http_to_linker_async`) — GATED (`GatedHttpHooks::send_request` runs
+  the origin allowlist + SSRF / private-IP block + https-only before any real
+  send; an empty allowlist — the `GoGuestState` default here — denies all and
+  returns `HttpRequestDenied`). Present for the JS/jco baseline; outbound refused.
+- **`hellohq:plugin/*`** (`CapstoneHarness::add_to_linker_get`) — the gated
+  capabilities, reused verbatim from the Rust capstone host.
+
+On `guest.run` the Go plugin does the same flow the capstone proves: log lines, a
+gated workspace read (2 canned portfolios), a storage round-trip
+(`greeting`="hello"), an `events.emit("quickstart-ran","ok")`, and returns the
+compact summary `"2|1"` when granted (or `Err` carrying the gate message when
+denied).
+
+Verify imports/exports (note: the TinyGo `wasip2` guest imports the `wasi:0.2`
+surface but NOT `wasi:http` — that is the JS/jco case the linker also supports):
+
+```sh
+wasm-tools component wit tests/fixtures/go_guest.component.wasm
+# import hellohq:plugin/{types,workspace,storage,events,log}@0.1.0;
+# import wasi:cli/{environment,stdin,stdout,stderr}@0.2.0;
+# import wasi:clocks/{monotonic-clock,wall-clock}@0.2.0;
+# import wasi:filesystem/{types,preopens}@0.2.0;
+# import wasi:io/{error,streams}@0.2.0;
+# import wasi:random/random@0.2.0;
+# export hellohq:plugin/guest@0.1.0;
+```
+
+> The guest imports `wasi:*@0.2.0`; `wasmtime-wasi@45` provides `wasi:*@0.2.x`.
+> Wasmtime resolves the import against the compatible `0.2.x` it provides
+> (semver-compat within `0.2`), so instantiation succeeds — confirmed by the
+> passing `tests/go_guest.rs`.
+
+### Regenerate
+
+Source: the SDK example `../../../plugin-sdk/examples/component-quickstart-go/`.
+It depends on the Go SDK (`../../sdks/go`) and builds against the SDK's vendored
+WIT. Requires **TinyGo >= 0.41** and `wasm-tools`. TinyGo's `wasip2` target emits
+a Component Model component directly — no `wasm-tools component new` step:
+
+```sh
+# from repo root:
+( cd ../plugin-sdk/examples/component-quickstart-go && bash build.sh )
+cp ../plugin-sdk/examples/component-quickstart-go/component_quickstart_go.component.wasm \
+  tests/fixtures/go_guest.component.wasm
+```
+
+`scripts/regen_probe_guest.sh` regenerates all fixtures (incl. this one).

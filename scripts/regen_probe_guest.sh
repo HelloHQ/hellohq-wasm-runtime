@@ -102,3 +102,25 @@ if [ -d "$QUICKSTART_DIR" ]; then
 else
   echo "SKIP: $QUICKSTART_DIR not found; capstone fixture not regenerated" >&2
 fi
+
+# GO GUEST fixture (go_guest.component.wasm): the real TinyGo-built Go SDK
+# quickstart (plugin-sdk/examples/component-quickstart-go). It embeds the TinyGo
+# language runtime, so on top of the four hellohq:plugin/* capabilities it also
+# imports the wasi:0.2 surface (cli/io/clocks/filesystem/random). Built with
+# `tinygo build -target=wasip2` (a Component Model component directly — no
+# separate `wasm-tools component new` step). Its own build.sh does the build; we
+# just copy the result in. Drives the "support all WASI generations" test
+# (tests/go_guest.rs), where the host satisfies wasi:0.2 (locked-down) +
+# wasi:http@0.2 (deny-by-default) + hellohq:plugin/* on one linker.
+GO_DIR="../plugin-sdk/examples/component-quickstart-go"
+GO_BUILT="$GO_DIR/component_quickstart_go.component.wasm"
+GO_OUT="tests/fixtures/go_guest.component.wasm"
+
+if [ -d "$GO_DIR" ]; then
+  ( cd "$GO_DIR" && bash build.sh )
+  cp "$GO_BUILT" "$GO_OUT"
+  echo "Wrote $GO_OUT"
+  wasm-tools component wit "$GO_OUT"
+else
+  echo "SKIP: $GO_DIR not found; go_guest fixture not regenerated" >&2
+fi

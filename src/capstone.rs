@@ -136,6 +136,21 @@ impl CapstoneHarness {
             |state| state,
         )
     }
+
+    /// Register the four capability imports into a linker whose store state `T`
+    /// is NOT `CapstoneHarness` itself but EMBEDS one (reachable via `get`). This
+    /// is what lets a richer store state — e.g. one that also carries a
+    /// `wasmtime_wasi::WasiCtx` + `ResourceTable` to satisfy a Go/JS guest's
+    /// `wasi:*` imports — provide `hellohq:plugin/*` from the SAME store. The
+    /// capability host funcs are all SYNC; linking them into an otherwise-async
+    /// linker (WASI uses `add_to_linker_async`) is fine — sync host funcs are
+    /// allowed on an async linker.
+    pub fn add_to_linker_get<T: Send + 'static>(
+        linker: &mut wasmtime::component::Linker<T>,
+        get: fn(&mut T) -> &mut CapstoneHarness,
+    ) -> wasmtime::Result<()> {
+        CapstoneHost::add_to_linker::<T, wasmtime::component::HasSelf<CapstoneHarness>>(linker, get)
+    }
 }
 
 /// Map the composed `StorageEventsHost` world's `api-error` onto THIS world's

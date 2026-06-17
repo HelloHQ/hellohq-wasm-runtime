@@ -81,6 +81,26 @@ pub mod storage_events;
 #[allow(dead_code)]
 pub mod capstone;
 
+// The store state + WASI wiring to run JS (jco) / Go (TinyGo) SDK plugin
+// components, which import a `wasi:*@0.2` surface (a JS engine / the TinyGo
+// runtime) in addition to `hellohq:plugin/*`. Holds a locked-down
+// `wasmtime_wasi::WasiCtx` + `ResourceTable` (no preopens/env/network) so the
+// `wasi:*` imports resolve but grant nothing ambient, plus the `CapstoneHarness`
+// backing the gated capabilities. Behind the `wasi-guests` feature (pulls heavy
+// deps: tokio, cap-std), so default / `--no-default-features` (iOS no-JIT) are
+// unaffected. Drives tests/go_guest.rs (a real TinyGo component on the runtime).
+#[cfg(feature = "wasi-guests")]
+#[allow(dead_code)]
+pub mod wasi_guests;
+
+// The outbound-fetch gate (origin allowlist + H4/H5 SSRF / private-IP block +
+// https-only) that `wasi_guests`'s `GatedHttpHooks` runs before letting a
+// JS/Go guest's `wasi:http@0.2` outbound request reach the real sender. Plain
+// Rust, no Wasmtime types; a faithful port of the hellohq app's
+// `PluginNetworkService`. Behind `wasi-guests` since that is its only consumer.
+#[cfg(feature = "wasi-guests")]
+pub mod fetch_gate;
+
 pub const HWR_ABI_VERSION: u32 = 1;
 
 // In-process Wasm compilation/execution requires Cranelift and is available only

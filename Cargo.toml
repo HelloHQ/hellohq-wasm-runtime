@@ -36,6 +36,39 @@ wasmtime = { version = "45.0.1", default-features = false, features = [
 # entrypoint — the "block on a blockable worker isolate" bridge (docs 51/52).
 # Base (non-optional) because the P3 host-call round-trip must work on the iOS
 # no-JIT build too, not only `compile` builds.
+# WASI 0.2 host implementation, version-matched to `wasmtime` (45). Provides the
+# `wasi:*@0.2.x` interfaces JS (jco) and Go (TinyGo) SDK components import — Rust
+# no-std guests import only `hellohq:plugin/*`, but those richer guests embed a
+# language runtime that ALSO imports the wasi:0.2 surface, so the host must
+# satisfy it (locked-down) or instantiation fails. OPTIONAL + behind the
+# `wasi-guests` feature: it pulls heavy deps (tokio, cap-std, …) and is Cranelift-
+# adjacent, so default / `--no-default-features` (the iOS no-JIT size budget)
+# stay unaffected. Pinned to 45 so its WASI 0.2 interfaces match wasmtime 45's
+# component-model ABI (a version mismatch fails to compile / links the wrong
+# wasi version).
+wasmtime-wasi = { version = "45", optional = true }
+# WASI 0.2 `wasi:http` host, version-matched to `wasmtime` (45). JS (jco)
+# components import `wasi:http@0.2` as part of the engine baseline even when
+# unused, so the interface must be PRESENT to instantiate. We register it behind
+# a GATE (`GatedHttpHooks` in `src/wasi_guests.rs` + `src/fetch_gate.rs`): every
+# outbound request must pass an origin allowlist + the H4/H5 SSRF/private-IP
+# block set + https-only before the real send runs; an empty allowlist denies
+# all (the safe default). Same heavy-deps / feature-gating story as
+# `wasmtime-wasi` (tokio, hyper, cap-std), so it rides the `wasi-guests`
+# feature only — default / `--no-default-features` (iOS no-JIT) stay unaffected.
+wasmtime-wasi-http = { version = "45", optional = true }
+# Only used to name the `hyper::Request` type in the gated
+# `GatedHttpHooks::send_request` signature (the request body type comes from
+# `wasmtime-wasi-http`). Version-matched to what `wasmtime-wasi-http@45` pulls in
+# (hyper 1.x). Optional + in `wasi-guests` only — it's already a transitive dep
+# of `wasmtime-wasi-http`, so this adds no new code to default/iOS builds.
+hyper = { version = "1", optional = true }
+# Used ONLY by the `wasi:http@0.2` gate unit tests, to build an empty
+# `HyperOutgoingBody` to hand `GatedHttpHooks::send_request`. Both are already
+# transitive deps of `wasmtime-wasi-http@45`; optional + in `wasi-guests` only,
+# so default / `--no-default-features` (iOS no-JIT) stay unaffected.
+http-body-util = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
 pollster = "0.4.0"
 # Oneshot + mpsc channels for the P3 round-trip: the host import awaits a value
 # the caller (Dart) supplies via `hwr_p3_resolve`/streaming push from another
@@ -60,6 +93,16 @@ ios-bench = []
 # is NOT required since the test builds only an Engine, but the bindgen output
 # uses component-model-async which is in the base wasmtime features.
 wasi-http = []
+# Run JS (jco) / Go (TinyGo) SDK plugin components, which import a `wasi:*@0.2`
+# surface in addition to `hellohq:plugin/*`. Pulls in `wasmtime-wasi` (heavy:
+# tokio, cap-std) to satisfy those wasi imports with a LOCKED-DOWN ctx (no
+# preopens, no env, no network) so the plugin gets no ambient FS/network — its
+# real capabilities stay gated to `hellohq:plugin/*`. Implies `wasi-http`
+# (reuses the `capstone` host harness module) and `compile` (the Go-guest test
+# compiles a component via Cranelift). OUT of default + `--no-default-features`
+# so the iOS no-JIT size is unaffected — the iOS size / cross-compile of
+# wasmtime-wasi is a deliberate follow-on, not solved here.
+wasi-guests = ["wasi-http", "compile", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http", "dep:hyper", "dep:http-body-util", "dep:bytes"]
 
 # Examples gated by the features they need, so `cargo build --no-default-features
 # [--examples]` (the iOS no-JIT link check) never tries to compile a Cranelift-only
