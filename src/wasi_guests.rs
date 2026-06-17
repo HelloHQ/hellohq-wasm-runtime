@@ -71,7 +71,7 @@ use wasmtime_wasi_http::WasiHttpCtx;
 /// so tests can supply a canned sender (no real network); the production default
 /// is [`default_sender`], which delegates to `wasmtime_wasi_http`'s turnkey
 /// in-process hyper path (`default_send_request`).
-type SendFn = Box<
+pub type SendFn = Box<
     dyn FnMut(
             hyper::Request<HyperOutgoingBody>,
             OutgoingRequestConfig,
@@ -92,6 +92,45 @@ fn default_sender(
     Ok(wasmtime_wasi_http::p2::default_send_request(
         request, config,
     ))
+}
+
+/// Test / embedder **stub** sender support: build a [`SendFn`] that performs NO
+/// real network I/O — it flips `reached` to `true` (proving the gate passed and
+/// delegated to the send step) and returns a ready `HostFutureIncomingResponse`
+/// carrying the given `status` and an empty body.
+///
+/// Wired via [`GoGuestState::with_origins_and_sender`] so an integration test
+/// (or an embedder needing a canned response) can drive a real `wasi:http@0.2`
+/// guest end-to-end through [`GatedHttpHooks`] without touching the wire — the
+/// gate decision always runs first regardless of the injected sender.
+#[doc(hidden)]
+pub fn canned_status_sender(
+    status: u16,
+    reached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> SendFn {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Empty};
+    use std::sync::atomic::Ordering;
+    use wasmtime_wasi_http::p2::types::IncomingResponse;
+
+    Box::new(move |_req, cfg| {
+        reached.store(true, Ordering::SeqCst);
+        let resp = hyper::Response::builder()
+            .status(status)
+            .body(
+                Empty::<Bytes>::new()
+                    .map_err(|_| unreachable!())
+                    .boxed_unsync(),
+            )
+            .expect("build canned response");
+        Ok(HostFutureIncomingResponse::ready(Ok(Ok(
+            IncomingResponse {
+                resp,
+                worker: None,
+                between_bytes_timeout: cfg.between_bytes_timeout,
+            },
+        ))))
+    })
 }
 
 /// Gated `wasi:http@0.2` hooks. Every outbound `send_request`:
@@ -208,6 +247,23 @@ impl GoGuestState {
         }
     }
 
+    /// Like [`GoGuestState::with_origins`], but with a **custom (injectable)**
+    /// outbound `send` step ([`GatedHttpHooks::with_sender`]). The fetch gate
+    /// still runs first against `allowlist`; `send` is reached ONLY on a request
+    /// the gate allows. Used by the `wasi:http@0.2` end-to-end test (and any
+    /// embedder needing a canned sender) to observe the gate decision without
+    /// touching the network — pair with [`canned_status_sender`].
+    pub fn with_origins_and_sender(granted: bool, allowlist: Vec<String>, send: SendFn) -> Self {
+        let ctx = WasiCtxBuilder::new().build();
+        GoGuestState {
+            table: ResourceTable::new(),
+            ctx,
+            http_ctx: WasiHttpCtx::new(),
+            http_hooks: GatedHttpHooks::with_sender(allowlist, send),
+            harness: CapstoneHarness::new(granted),
+        }
+    }
+
     /// Wire **all WASI generations + the custom capabilities** into one linker:
     ///   1. `wasmtime_wasi::p2::add_to_linker_async` → every `wasi:*@0.2` runtime
     ///      interface (cli/io/clocks/filesystem/random), async variant.
@@ -301,7 +357,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
-    use wasmtime_wasi_http::p2::types::IncomingResponse;
     use wasmtime_wasi_http::p2::WasiHttpHooks;
 
     fn empty_body() -> UnsyncBoxBody<Bytes, ErrorCode> {
@@ -328,26 +383,11 @@ mod tests {
 
     /// A canned sender that flips a flag when reached and returns a ready 200 —
     /// no real network. Lets the allow-path tests prove the gate delegated to
-    /// the send step without touching the wire.
+    /// the send step without touching the wire. Delegates to the public
+    /// [`canned_status_sender`] (parameterized by status), reused by the
+    /// `wasi:http@0.2` end-to-end test.
     fn canned_sender(reached: Arc<AtomicBool>) -> SendFn {
-        Box::new(move |_req, cfg| {
-            reached.store(true, Ordering::SeqCst);
-            let resp = hyper::Response::builder()
-                .status(200)
-                .body(
-                    Empty::<Bytes>::new()
-                        .map_err(|_| unreachable!())
-                        .boxed_unsync(),
-                )
-                .expect("build canned 200 response");
-            Ok(HostFutureIncomingResponse::ready(Ok(Ok(
-                IncomingResponse {
-                    resp,
-                    worker: None,
-                    between_bytes_timeout: cfg.between_bytes_timeout,
-                },
-            ))))
-        })
+        canned_status_sender(200, reached)
     }
 
     fn assert_denied(result: HttpResult<HostFutureIncomingResponse>, msg: &str) {

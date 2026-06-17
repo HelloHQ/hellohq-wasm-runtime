@@ -54,6 +54,23 @@ wasm-tools component new "$POST_CORE" -o "$POST_OUT"
 echo "Wrote $POST_OUT"
 wasm-tools component wit "$POST_OUT"
 
+# wasi:http@0.2 END-TO-END gate guest (http02-guest world in wit-wasi-02):
+# imports ONLY wasi:http/{types,outgoing-handler}@0.2.10 (+ wasi:io/poll@0.2.10),
+# exports `run(authority, use-https) -> result<u16, u8>` which builds an outgoing
+# GET request, calls outgoing-handler.handle, blocks on the response future, and
+# returns the status (Ok) or a denial/error marker (Err). Isolated crate
+# test-guest-http-02. Drives the gate end-to-end test (tests/http02_guest.rs),
+# where the real guest observes the GatedHttpHooks allow (200) vs deny
+# (HttpRequestDenied -> Err(2)) decision.
+HTTP02_CORE="test-guest-http-02/target/wasm32-unknown-unknown/release/http02_guest.wasm"
+HTTP02_OUT="tests/fixtures/http02_guest.component.wasm"
+
+( cd test-guest-http-02 && cargo build --release --target wasm32-unknown-unknown )
+wasm-tools component new "$HTTP02_CORE" -o "$HTTP02_OUT"
+
+echo "Wrote $HTTP02_OUT"
+wasm-tools component wit "$HTTP02_OUT"
+
 # ai:inference streaming guest (inference-guest world in wit/world.wit): imports
 # ONLY hellohq:plugin/{inference,types}, exports `run` which calls
 # inference.complete([{role:"user",content:"hello"}], {max-tokens:64}), drains

@@ -1,0 +1,20 @@
+// Guest-side world for the wasi:http@0.2 END-TO-END gate proof
+// (tests/http02_guest.rs). A guest built against this imports ONLY
+// wasi:http/{types,outgoing-handler}@0.2.10 — it constructs an outgoing GET
+// request, calls outgoing-handler.handle, polls the future-incoming-response to
+// completion, and returns the response status (Ok) or a denial/error marker
+// (Err). The host wires it through `GatedHttpHooks` so the guest itself observes
+// the fetch gate's allow (HTTP 200) vs deny (HttpRequestDenied) decision.
+//
+// The world pulls in wasi:io (poll/streams/error) transitively (pollable +
+// outgoing-body streams) and may pull wasi:clocks (request-options duration);
+// the host's `wasmtime_wasi` + `wasmtime_wasi_http` linkers satisfy those.
+package hellohq:http02-probe;
+
+world http02-guest {
+  import wasi:http/types@0.2.10;
+  import wasi:http/outgoing-handler@0.2.10;
+  // authority e.g. "api.example.com"; use-https chooses the scheme.
+  // Ok(status-code) on a response; Err(code) on denial/error (see lib.rs).
+  export run: func(authority: string, use-https: bool) -> result<u16, u8>;
+}

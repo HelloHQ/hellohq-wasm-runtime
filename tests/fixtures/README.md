@@ -180,6 +180,68 @@ wasm-tools component new \
 
 `scripts/regen_probe_guest.sh` regenerates all six fixtures.
 
+## `http02_guest.component.wasm`
+
+A WebAssembly **component** built against the `http02-guest` world
+(`../../wit-wasi-02/world.wit`) for the **wasi:http@0.2 fetch-gate END-TO-END
+proof** (`tests/http02_guest.rs`).
+
+This is the REAL `wasi:http@0.2` guest that drives the `GatedHttpHooks` gate
+end-to-end: the guest itself observes the [`crate::fetch_gate`] decision. It
+imports ONLY `wasi:http/types@0.2.10` and `wasi:http/outgoing-handler@0.2.10`
+(plus the transitively-used `wasi:io/poll@0.2.10` for the response
+`pollable.block()`) and exports `run: func(authority: string, use-https: bool)
+-> result<u16, u8>`. Its `run` builds an outgoing GET request to
+`{scheme}://{authority}/` (scheme chosen by `use-https`), calls
+`outgoing-handler::handle`, blocks on the returned `future-incoming-response`
+(the SYNC guest blocks while Wasmtime drives the host's async send underneath),
+and returns the response status on success or an error marker:
+
+- `Ok(status)` — the gate allowed the request and the host's (injected) sender
+  returned a response (HTTP 200 in the test),
+- `Err(2)` — `HttpRequestDenied` (the gate's refusal); with
+  `wasmtime-wasi-http@45` the gated hooks' error surfaces from `handle()`
+  directly (the future is never produced), so the guest maps that `handle()`
+  `Err(HttpRequestDenied)` to `Err(2)`,
+- `Err(1)` — a non-denial `handle()` `ErrorCode`; `Err(3)` — a non-denial future
+  `ErrorCode`; `Err(4)` — the future produced no value.
+
+The host test wires `handle` through `GoGuestState`'s `GatedHttpHooks` with a
+canned 200 sender, so each case asserts BOTH the guest-observed result AND
+whether the send step ran — proving a denial is refused before any network I/O.
+
+The guest imports **NO** `wasi:sockets` and **NO** `wasi:filesystem` — confirmed
+by `wasm-tools component wit` (only `wasi:http@0.2.10` + `wasi:io@0.2.10`):
+
+```sh
+wasm-tools component wit tests/fixtures/http02_guest.component.wasm
+# import wasi:io/poll@0.2.10;
+# import wasi:http/types@0.2.10;
+# import wasi:http/outgoing-handler@0.2.10;
+# export run: func(authority: string, use-https: bool) -> result<u16, u8>;
+```
+
+### Regenerate
+
+Source crate: `../../test-guest-http-02/` (an isolated crate — its own
+`[workspace]` root). It references the vendored `../../wit-wasi-02/` via `path:
+"../wit-wasi-02"` in the `wit_bindgen::generate!` macro (with `generate_all` to
+pull in the transitively-used `wasi:http/types` + `wasi:io` interfaces), so the
+WIT stays single-source. The vendored WIT is the extracted `wasi:http@0.2.10`
+package (`http.wit` + the minimal deps `io.wit`, `clocks.wit`).
+
+Same toolchain as above (`wasm32-unknown-unknown` target + `wasm-tools`):
+
+```sh
+# from repo root:
+( cd test-guest-http-02 && cargo build --release --target wasm32-unknown-unknown )
+wasm-tools component new \
+  test-guest-http-02/target/wasm32-unknown-unknown/release/http02_guest.wasm \
+  -o tests/fixtures/http02_guest.component.wasm
+```
+
+`scripts/regen_probe_guest.sh` regenerates all fixtures.
+
 ## `inference_guest.wasm`
 
 A WebAssembly **component** built against the `inference-guest` world
