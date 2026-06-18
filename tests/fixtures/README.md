@@ -178,7 +178,55 @@ wasm-tools component new \
   -o tests/fixtures/http_guest_post.wasm
 ```
 
-`scripts/regen_probe_guest.sh` regenerates all six fixtures.
+`scripts/regen_probe_guest.sh` regenerates all fixtures.
+
+## `http_guest_req_trailers.wasm`
+
+A WebAssembly **component** built against the `http-guest-req-trailers` world
+(`../../wit-wasi/world.wit`) for the **request-TRAILERS surfacing** proof
+(`tests/http_handle.rs`).
+
+Same import/export surface as `http_guest.wasm` (imports ONLY `wasi:http/types`
++ `wasi:http/handler`; exports `run: async func() -> list<u8>`), but `run`
+builds a **GET** request to `example.com/` carrying a **request trailers**
+future. It mints the future via `wit_future::new::<Result<Option<Fields>,
+ErrorCode>>()` and — because `wit_future::new`'s closure is only the
+*default-on-drop* value, and the host drains the trailers future *while*
+servicing `handle` — `wit_bindgen::spawn_local`s a task that writes the real
+value `Ok(Some(fields))` (a `Fields` carrying `x-trace` = "req-trailer-1") to the
+writer half, concurrently with `handle().await` (mirroring how the POST guest
+writes its request body). The host drains that future host-side (via a
+`FutureConsumer`) and surfaces the trailers OUT on the head as a reserved
+`x-hellohq-request-trailers: x-trace=<hex>` line (values hex-encoded) — so the
+host test can assert the request trailers reached the servicer. `run` returns the
+response status bytes.
+
+The `async-spawn` feature of `wit-bindgen` is enabled (in the guest crate's
+`Cargo.toml`) for `spawn_local`.
+
+Verify imports/exports:
+
+```sh
+wasm-tools component wit tests/fixtures/http_guest_req_trailers.wasm
+# import wasi:http/types@0.3.0-rc-2026-01-06;
+# import wasi:http/handler@0.3.0-rc-2026-01-06;
+# export run: async func() -> list<u8>;
+```
+
+### Regenerate
+
+Source crate: `../../test-guest-http-req-trailers/` (an isolated crate — its own
+`[workspace]` root). References the parent `wit-wasi/` via `path: "../wit-wasi"`.
+
+```sh
+# from repo root:
+( cd test-guest-http-req-trailers && cargo build --release --target wasm32-unknown-unknown )
+wasm-tools component new \
+  test-guest-http-req-trailers/target/wasm32-unknown-unknown/release/http_guest_req_trailers.wasm \
+  -o tests/fixtures/http_guest_req_trailers.wasm
+```
+
+`scripts/regen_probe_guest.sh` regenerates all fixtures.
 
 ## `http02_guest.component.wasm`
 

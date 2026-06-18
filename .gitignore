@@ -20,5 +20,6 @@ ios-bench/Resources/*.cwasm
 /test-guest-http/target
 /test-guest-http-02/target
 /test-guest-http-post/target
+/test-guest-http-req-trailers/target
 /test-guest-inference/target
 /test-guest-storage-events/target

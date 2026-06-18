@@ -1002,7 +1002,7 @@ async fn handle_via_transport<T: Send>(
     //     receiver — all inside one `with`, dropping the borrow before we await.
     //     The outbound stream is NOT ended here: if there's a request body we
     //     stream its bytes out as further OUT frames first (step 1b).
-    let (inbound, req_body) = accessor.with(|mut access| {
+    let (inbound, req_body, req_trailers) = accessor.with(|mut access| {
         let host = access.get();
         let Some(req) = host.requests.get(request.rep()) else {
             return Err(ErrorCode::InternalError(Some(
@@ -1051,10 +1051,11 @@ async fn handle_via_transport<T: Send>(
         // Take the stashed request-body stream out (so we can stream it OUT) and
         // the inbound receiver out (so we can await it without the borrow).
         let host = access.get();
-        let req_body = host
+        let (req_body, req_trailers) = host
             .requests
             .get_mut(request.rep())
-            .and_then(|r| r.body.take());
+            .map(|r| (r.body.take(), r.trailers.take()))
+            .unwrap_or((None, None));
         let Some(transport) = host.transport.as_mut() else {
             return Err(ErrorCode::InternalError(Some(
                 "wasi:http handler: transport missing".to_string(),
@@ -1062,7 +1063,7 @@ async fn handle_via_transport<T: Send>(
         };
         transport.out.chunk(head.into_bytes());
         let inbound = transport.inbound.take();
-        Ok((inbound, req_body))
+        Ok((inbound, req_body, req_trailers))
     })?;
 
     // (1b) If the request carries a body, stream it OUT frame-by-frame before
@@ -1096,7 +1097,55 @@ async fn handle_via_transport<T: Send>(
         }
     }
 
-    // End the outbound stream: head (+ any body frames) have been emitted.
+    // (1c) Drain the guest's REQUEST trailers future (stashed in `request::new`)
+    //      and, if it yields `Ok(Some(fields))`, surface its entries OUT as a
+    //      final reserved head line ([`REQUEST_TRAILERS_HEAD_KEY`]) BEFORE we
+    //      end the outbound stream — so the caller (and upstream) can see the
+    //      request trailers. We read the single-value future host-side via a
+    //      `FutureConsumer` ([`RequestTrailersConsumer`]) piped onto it, send the
+    //      item through a oneshot, and await it OUTSIDE `with` (mirrors the body
+    //      drain's borrow discipline). `Ok(None)` / `Err(_)` / channel errors
+    //      emit NO line (graceful — the common case, as for the other guests).
+    if let Some(future) = req_trailers {
+        let (tx, rx) = futures_channel::oneshot::channel();
+        accessor.with(|mut access| {
+            future
+                .pipe(&mut access, RequestTrailersConsumer { tx: Some(tx) })
+                .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))
+        })?;
+
+        // Await the trailers value, but only up to a bounded number of executor
+        // ticks — NOT indefinitely. A cooperating guest resolves its trailers
+        // future *concurrently* with `handle` (mirroring the request body), so a
+        // few yields are enough for the piped consumer to fire. The common
+        // no-trailers guests, however, hold the writer until their `run` returns
+        // (after `handle`), so the future never resolves during `handle`; we must
+        // NOT block on it (that would deadlock). We `select` `rx` against a small
+        // yield budget: if the budget expires first we emit NO line and proceed
+        // (the still-pending writer is harmlessly resolved/dropped later by the
+        // guest). `Ok(None)` / `Err(_)` / channel error also emit nothing.
+        let resolved = await_trailers_bounded(rx).await;
+        if let Some(Ok(Ok(Some(fields_rep)))) = resolved {
+            // Look up the trailer fields' entries inside a fresh `with`, format
+            // the reserved line, and emit it as a final OUT frame.
+            let line = accessor.with(|mut access| {
+                let host = access.get();
+                host.fields
+                    .get(fields_rep.rep())
+                    .and_then(|f| format_request_trailers_line(&f.entries))
+            });
+            if let Some(line) = line {
+                accessor.with(|mut access| {
+                    let host = access.get();
+                    if let Some(transport) = host.transport.as_mut() {
+                        transport.out.chunk(line.into_bytes());
+                    }
+                });
+            }
+        }
+    }
+
+    // End the outbound stream: head (+ any body frames + trailers line) emitted.
     accessor.with(|mut access| {
         let host = access.get();
         if let Some(transport) = host.transport.as_mut() {
@@ -1288,6 +1337,106 @@ impl<D> wasmtime::component::StreamConsumer<D> for RequestBodyConsumer {
     }
 }
 
+/// A [`FutureConsumer`] that reads the guest's request-trailers `future<result<
+/// option<trailers>, error-code>>` host-side and forwards the single resolved
+/// value through a oneshot channel, so the `handle` driver can surface it OUT.
+/// Mirrors [`RequestBodyConsumer`] but for a single value: it reads the one item
+/// from the `source` into a `Vec`, sends it, and reports completion. If asked to
+/// `finish` without consuming, it honors that immediately (sending nothing →
+/// the driver's receiver errors → no trailers line, graceful).
+///
+/// [`FutureConsumer`]: wasmtime::component::FutureConsumer
+struct RequestTrailersConsumer {
+    tx: Option<
+        futures_channel::oneshot::Sender<
+            Result<Option<wasmtime::component::Resource<Fields>>, ErrorCode>,
+        >,
+    >,
+}
+
+impl<D> wasmtime::component::FutureConsumer<D> for RequestTrailersConsumer {
+    type Item = Result<Option<wasmtime::component::Resource<Fields>>, ErrorCode>;
+
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        mut store: wasmtime::StoreContextMut<D>,
+        mut source: wasmtime::component::Source<'_, Self::Item>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<()>> {
+        use wasmtime::AsContextMut;
+
+        // Asked to wrap up without consuming: drop our sender (→ the driver's
+        // receiver errors → no trailers line). Graceful.
+        if finish {
+            return Poll::Ready(Ok(()));
+        }
+
+        // Read the single available value into a buffer, exactly like
+        // `RequestBodyConsumer` reads `Vec<u8>` — here the item is the trailers
+        // result. A future yields at most one value.
+        let available = source.remaining(store.as_context_mut());
+        if available == 0 {
+            // Nothing to consume right now and not finishing.
+            return Poll::Ready(Ok(()));
+        }
+        let mut buffer: Vec<Self::Item> = Vec::with_capacity(available);
+        source
+            .read(store.as_context_mut(), &mut buffer)
+            .map_err(|e| anyhow_msg(format!("request trailers read failed: {e}")))?;
+
+        if let (Some(tx), Some(value)) = (self.tx.take(), buffer.into_iter().next()) {
+            let _ = tx.send(value);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Await the request-trailers oneshot `rx`, but only up to a bounded number of
+/// executor ticks. Returns `Some(value)` if `rx` resolved within the budget (or
+/// errored — `Some(Err(..))`), or `None` if the budget expired first (the guest
+/// deferred the trailers write past `handle`, the common no-trailers case).
+///
+/// This avoids blocking `handle` indefinitely on a future a guest may only
+/// resolve after `handle` returns, while still giving a cooperating guest (which
+/// resolves its trailers future concurrently, like the request body) ample ticks
+/// for the piped consumer to fire. We `select` `rx` against a counter future
+/// that yields `YIELD_BUDGET` times then resolves.
+async fn await_trailers_bounded(
+    rx: futures_channel::oneshot::Receiver<
+        Result<Option<wasmtime::component::Resource<Fields>>, ErrorCode>,
+    >,
+) -> Option<
+    Result<
+        Result<Option<wasmtime::component::Resource<Fields>>, ErrorCode>,
+        futures_channel::oneshot::Canceled,
+    >,
+> {
+    // A cooperating guest's spawned writer resolves within a tick or two; this
+    // budget is generous headroom while staying strictly bounded.
+    const YIELD_BUDGET: usize = 64;
+
+    let mut remaining = YIELD_BUDGET;
+    let budget = std::future::poll_fn(move |cx| {
+        if remaining == 0 {
+            Poll::Ready(())
+        } else {
+            remaining -= 1;
+            // Re-schedule so the executor keeps driving the piped consumer (and
+            // any guest task) before we re-poll.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    });
+
+    use futures_util::future::{select, Either};
+    futures_util::pin_mut!(budget);
+    match select(rx, budget).await {
+        Either::Left((value, _budget)) => Some(value),
+        Either::Right(((), _rx)) => None,
+    }
+}
+
 /// Build a `wasmtime::Error` from a message string (avoids pulling in `anyhow`
 /// macros for the few error sites in this module).
 fn anyhow_msg(msg: String) -> wasmtime::Error {
@@ -1335,6 +1484,13 @@ const REQUEST_OPTIONS_HEAD_KEY: &str = "x-hellohq-request-options";
 /// arbitrary bytes survive the `;`/`=`/`\n`-delimited head framing.
 const TRAILERS_HEAD_KEY: &str = "x-hellohq-trailers";
 
+/// Reserved OUT head line carrying the guest's REQUEST trailer fields (drained
+/// from the request's trailers future) so the caller (and upstream) can see
+/// them: `x-hellohq-request-trailers: <name>=<hex(value)>;...`. Distinct from
+/// the response [`TRAILERS_HEAD_KEY`] (which rides the IN head). Values are
+/// hex-encoded so arbitrary bytes survive the `;`/`=`/`\n` head framing.
+const REQUEST_TRAILERS_HEAD_KEY: &str = "x-hellohq-request-trailers";
+
 /// Format the [`REQUEST_OPTIONS_HEAD_KEY`] line for `opts`, or `None` if no
 /// timeout is set (so no line is emitted). `Duration` is `u64` nanoseconds.
 fn format_request_options_line(opts: &RequestOptionsData) -> Option<String> {
@@ -1370,6 +1526,30 @@ fn parse_trailers_line(value: &str) -> Vec<(String, FieldValue)> {
         }
     }
     out
+}
+
+/// Encode bytes as a lowercase hex string — the inverse of [`hex_decode`].
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Format the [`REQUEST_TRAILERS_HEAD_KEY`] line for `entries` (the guest's
+/// request trailer fields), or `None` if empty (so no line is emitted). Values
+/// are hex-encoded, mirroring [`parse_trailers_line`]'s decode so the Dart side
+/// hex-decodes them: `x-hellohq-request-trailers: <name>=<hex(value)>;...`.
+fn format_request_trailers_line(entries: &[(String, FieldValue)]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = entries
+        .iter()
+        .map(|(name, value)| format!("{name}={}", hex_encode(value)))
+        .collect();
+    Some(format!("{REQUEST_TRAILERS_HEAD_KEY}: {}", parts.join(";")))
 }
 
 /// Decode a lowercase/uppercase hex string to bytes; `None` on odd length or a
@@ -1751,5 +1931,43 @@ mod tests {
             parse_trailers_line("good=31;nobad;odd=1"),
             vec![("good".to_string(), b"1".to_vec())]
         );
+    }
+
+    #[test]
+    fn hex_encode_roundtrips_with_decode() {
+        assert_eq!(hex_encode(&[0x00, 0xff]), "00ff");
+        assert_eq!(hex_encode(b""), "");
+        // Round-trip: encode then decode is the identity (binary-safe).
+        let bytes = b"a;b=c".to_vec();
+        assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes));
+    }
+
+    #[test]
+    fn request_trailers_line_omits_empty_and_emits_entries() {
+        // No entries → no line at all.
+        assert_eq!(format_request_trailers_line(&[]), None);
+
+        // A single entry hex-encodes its value; "req-trailer-1" → its hex.
+        let entries = vec![("x-trace".to_string(), b"req-trailer-1".to_vec())];
+        assert_eq!(
+            format_request_trailers_line(&entries).as_deref(),
+            Some(
+                format!(
+                    "x-hellohq-request-trailers: x-trace={}",
+                    hex_encode(b"req-trailer-1")
+                )
+                .as_str()
+            )
+        );
+
+        // Multiple entries are ';'-joined, and decode back via parse_trailers_line
+        // (binary-safe — value with ';' and '=' survives).
+        let entries = vec![
+            ("x-checksum".to_string(), b"a;b=c".to_vec()),
+            ("trace".to_string(), b"1".to_vec()),
+        ];
+        let line = format_request_trailers_line(&entries).unwrap();
+        let value = line.strip_prefix("x-hellohq-request-trailers: ").unwrap();
+        assert_eq!(parse_trailers_line(value), entries);
     }
 }

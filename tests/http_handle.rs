@@ -31,6 +31,12 @@ const GUEST_WASM: &[u8] = include_bytes!("fixtures/http_guest.wasm");
 /// ("req-body-123"). Regen: scripts/regen_probe_guest.sh.
 const POST_GUEST_WASM: &[u8] = include_bytes!("fixtures/http_guest_post.wasm");
 
+/// The request-TRAILERS fixture guest. Imports `wasi:http/{types,handler}`,
+/// exports `run() -> list<u8>`; builds a GET request whose request trailers
+/// future yields `Ok(Some(fields))` with `x-trace` = "req-trailer-1". Regen:
+/// scripts/regen_probe_guest.sh.
+const REQ_TRAILERS_GUEST_WASM: &[u8] = include_bytes!("fixtures/http_guest_req_trailers.wasm");
+
 /// Build an engine with Component Model async + concurrency support (required to
 /// mint streams/futures), optionally on the Pulley (no-JIT) backend.
 fn engine(use_pulley: bool) -> wasmtime::Result<Engine> {
@@ -290,4 +296,102 @@ fn cranelift_http_handle_post_request_body() {
 #[test]
 fn pulley_http_handle_post_request_body() {
     assert_post_transport(true);
+}
+
+// ─── Follow-on #2: REQUEST trailers surfaced OUT ─────────────────────────────
+//
+// The req-trailers guest builds a GET request whose request trailers future
+// resolves to `Ok(Some(fields))` carrying `x-trace` = "req-trailer-1". The host
+// drains that future and emits the trailers OUT on the head as a reserved
+// `x-hellohq-request-trailers: x-trace=<hex>` line (values hex-encoded). We
+// drain ALL outbound frames and assert that line appears with the hex of
+// "req-trailer-1", then push a 200 response and assert the guest received it.
+
+/// Lowercase-hex encode (matches the host's `hex_encode`) so the test computes
+/// the expected `x-trace=<hex>` value independently.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Drive the request-trailers round-trip: start the session with the trailers
+/// guest, drain the outbound frames (head + trailers line), push a 200 response,
+/// return the guest's run result and the concatenated outbound bytes.
+fn run_req_trailers_via_transport(use_pulley: bool) -> (Vec<u8>, Vec<u8>) {
+    unsafe {
+        let session = hwr_p3s_start_http(
+            use_pulley as i32,
+            REQ_TRAILERS_GUEST_WASM.as_ptr(),
+            REQ_TRAILERS_GUEST_WASM.len(),
+        );
+        assert!(!session.is_null(), "start failed (use_pulley={use_pulley})");
+
+        // (1) Drain ALL outbound frames (head + request-trailers line) to
+        //     OUT_END, concatenating them.
+        let mut outbound = Vec::new();
+        loop {
+            match hwr_p3s_poll(session) {
+                HWR_P3S_OUT => {
+                    let ptr = hwr_p3s_out_ptr(session);
+                    let len = hwr_p3s_out_len(session);
+                    outbound.extend_from_slice(std::slice::from_raw_parts(ptr, len));
+                }
+                HWR_P3S_OUT_END => break,
+                other => {
+                    panic!("unexpected status while draining: {other} (use_pulley={use_pulley})")
+                }
+            }
+        }
+
+        // (2) Push a framed 200 response, then close inbound.
+        let resp_head = b"200\nx-test: yes";
+        hwr_p3s_push(session, resp_head.as_ptr(), resp_head.len());
+        hwr_p3s_push_end(session);
+
+        // (3) Poll to DONE and read the run result.
+        assert_eq!(
+            hwr_p3s_poll(session),
+            HWR_P3S_DONE,
+            "expected DONE (use_pulley={use_pulley})"
+        );
+        let rptr = hwr_p3s_result_ptr(session);
+        let rlen = hwr_p3s_result_len(session);
+        let result = std::slice::from_raw_parts(rptr, rlen).to_vec();
+        hwr_p3s_free(session);
+        (result, outbound)
+    }
+}
+
+fn assert_req_trailers_transport(use_pulley: bool) {
+    let (out, outbound) = run_req_trailers_via_transport(use_pulley);
+
+    // The outbound frames must carry the reserved request-trailers head line
+    // with the hex of "req-trailer-1" — proving the guest's request trailers
+    // future was drained and surfaced OUT.
+    let outbound_str = String::from_utf8_lossy(&outbound);
+    let expected = format!(
+        "x-hellohq-request-trailers: x-trace={}",
+        hex_encode(b"req-trailer-1")
+    );
+    assert!(
+        outbound_str.contains(&expected),
+        "outbound missing request-trailers line {expected:?}: {outbound_str:?} \
+         (use_pulley={use_pulley})"
+    );
+
+    // The guest received the servicer's 200 response (status prefix only).
+    assert!(
+        out.len() >= 2,
+        "missing status prefix (use_pulley={use_pulley})"
+    );
+    let status = u16::from_le_bytes([out[0], out[1]]);
+    assert_eq!(status, 200, "status (use_pulley={use_pulley})");
+}
+
+#[test]
+fn cranelift_http_handle_request_trailers() {
+    assert_req_trailers_transport(false);
 }

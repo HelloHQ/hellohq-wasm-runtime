@@ -54,6 +54,23 @@ wasm-tools component new "$POST_CORE" -o "$POST_OUT"
 echo "Wrote $POST_OUT"
 wasm-tools component wit "$POST_OUT"
 
+# REQUEST-trailers guest (http-guest-req-trailers world in wit-wasi): imports
+# ONLY wasi:http/{types,handler}, exports `run` which builds a GET request whose
+# request trailers future resolves (concurrently, via a spawned writer) to
+# Ok(Some(fields)) carrying x-trace="req-trailer-1", calls handler.handle, and
+# returns the response status. Isolated crate test-guest-http-req-trailers.
+# Drives the request-trailers surfacing test (tests/http_handle.rs): the host
+# drains the trailers future and emits it OUT as the reserved
+# x-hellohq-request-trailers head line.
+REQTR_CORE="test-guest-http-req-trailers/target/wasm32-unknown-unknown/release/http_guest_req_trailers.wasm"
+REQTR_OUT="tests/fixtures/http_guest_req_trailers.wasm"
+
+( cd test-guest-http-req-trailers && cargo build --release --target wasm32-unknown-unknown )
+wasm-tools component new "$REQTR_CORE" -o "$REQTR_OUT"
+
+echo "Wrote $REQTR_OUT"
+wasm-tools component wit "$REQTR_OUT"
+
 # wasi:http@0.2 END-TO-END gate guest (http02-guest world in wit-wasi-02):
 # imports ONLY wasi:http/{types,outgoing-handler}@0.2.10 (+ wasi:io/poll@0.2.10),
 # exports `run(authority, use-https) -> result<u16, u8>` which builds an outgoing
