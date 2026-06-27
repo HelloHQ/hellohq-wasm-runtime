@@ -1,6 +1,6 @@
 [package]
 name = "hellohq-wasm-runtime"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "Async-first WebAssembly plugin runtime: Wasmtime (Component Model + WASI 0.3 async) over a C ABI, built for async host capabilities like streaming AI inference."
 license = "Apache-2.0"
