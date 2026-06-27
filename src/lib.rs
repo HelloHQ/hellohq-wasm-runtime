@@ -112,6 +112,12 @@ pub mod plugin_host;
 #[cfg(feature = "typed-hosts")]
 pub mod plugin_host_storage_events;
 
+// C1 keystone: the UNIFIED transport-backed plugin host — all four capabilities
+// on one store, driving the canonical `guest` export of a real SDK plugin. The
+// entrypoint the app binds (hwr_p3_start_plugin), replacing the generic path.
+#[cfg(feature = "typed-hosts")]
+pub mod plugin_host_full;
+
 pub const HWR_ABI_VERSION: u32 = 1;
 
 // In-process Wasm compilation/execution requires Cranelift and is available only
@@ -1174,6 +1180,91 @@ pub unsafe extern "C" fn hwr_p3_start_storage_events(
         };
         Box::into_raw(Box::new(p3_run_session_sync(move |tx| {
             crate::plugin_host_storage_events::drive_storage_events_run(engine, component, tx)
+        })))
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// C1 keystone (compile variant). Start a UNIFIED typed-plugin P3 run: a real
+/// SDK plugin that imports `hellohq:plugin/{workspace,storage,events,log}` and
+/// exports the canonical `guest` interface. Drives `guest.run(input)`; each typed
+/// capability call surfaces as a JSON host-call serviced via [hwr_p3_resolve],
+/// so `servicePluginHostCall` is reused. This is the entrypoint the app binds for
+/// a production plugin, replacing the generic `hostcall.call` [hwr_p3_start].
+///
+/// # Safety
+/// `component`/`input` must point to the given number of readable bytes.
+#[cfg(all(feature = "typed-hosts", feature = "compile"))]
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3_start_plugin_compile(
+    use_pulley: i32,
+    component: *const u8,
+    component_len: usize,
+    input: *const u8,
+    input_len: usize,
+) -> *mut HwrP3Session {
+    std::panic::catch_unwind(|| {
+        if component.is_null() {
+            return std::ptr::null_mut();
+        }
+        let comp_bytes = std::slice::from_raw_parts(component, component_len);
+        let input_bytes = if input.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(input, input_len).to_vec()
+        };
+        let engine = match p3_engine(use_pulley != 0) {
+            Ok(e) => e,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let component = match wasmtime::component::Component::new(&engine, comp_bytes) {
+            Ok(c) => c,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        Box::into_raw(Box::new(p3_run_session_sync(move |tx| {
+            crate::plugin_host_full::drive_plugin_run(engine, component, input_bytes, tx)
+        })))
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// As [hwr_p3_start_plugin_compile] but **deserializes** a precompiled component
+/// (the iOS no-JIT path). Available in every build with `typed-hosts`.
+///
+/// # Safety
+/// `component`/`input` must point to the given number of readable bytes;
+/// `component` must be this runtime's precompiled/serialized output.
+#[cfg(feature = "typed-hosts")]
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3_start_plugin(
+    use_pulley: i32,
+    component: *const u8,
+    component_len: usize,
+    input: *const u8,
+    input_len: usize,
+) -> *mut HwrP3Session {
+    std::panic::catch_unwind(|| {
+        if component.is_null() {
+            return std::ptr::null_mut();
+        }
+        let comp_bytes = std::slice::from_raw_parts(component, component_len);
+        let input_bytes = if input.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(input, input_len).to_vec()
+        };
+        let engine = match p3_engine(use_pulley != 0) {
+            Ok(e) => e,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        // SAFETY: caller guarantees the bytes came from this runtime's
+        // precompile/serialize (the trust boundary is the SHA-pinned fetch).
+        let component = match wasmtime::component::Component::deserialize(&engine, comp_bytes) {
+            Ok(c) => c,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        Box::into_raw(Box::new(p3_run_session_sync(move |tx| {
+            crate::plugin_host_full::drive_plugin_run(engine, component, input_bytes, tx)
         })))
     })
     .unwrap_or(std::ptr::null_mut())
