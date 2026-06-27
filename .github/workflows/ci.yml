@@ -79,13 +79,14 @@ jobs:
       - name: Add iOS targets (device + Apple-Silicon simulator)
         run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
       # The shipped iOS runtime is Pulley-only (no Cranelift) + wasi-http (the
-      # no-Cranelift streaming entrypoints), matching build-release.sh's
-      # build_nojit. Compile + link only — no execution.
-      - name: Cross-build iOS slices (Pulley, no JIT, wasi-http)
+      # no-Cranelift streaming entrypoints) + typed-hosts (the C1 typed
+      # capability entrypoints), matching build-release.sh's build_nojit.
+      # Compile + link only — no execution.
+      - name: Cross-build iOS slices (Pulley, no JIT, wasi-http + typed-hosts)
         run: |
           for target in aarch64-apple-ios aarch64-apple-ios-sim; do
             echo "::group::$target"
-            cargo build --no-default-features --features wasi-http --target "$target" --locked
+            cargo build --no-default-features --features "wasi-http typed-hosts" --target "$target" --locked
             echo "::endgroup::"
           done
 
@@ -101,8 +102,9 @@ jobs:
         run: cargo install cargo-ndk --locked
       - name: Resolve NDK path
         run: echo "ANDROID_NDK_HOME=${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}}" >> "$GITHUB_ENV"
-      # Mirrors build-release.sh: Android ships Cranelift + wasi-http (so the
-      # streaming entrypoints the Dart loader resolves are present in the .so).
-      # Compile + link the three ABIs only — no jniLibs staging, no execution.
-      - name: Cross-build jniLibs (Cranelift + wasi-http)
-        run: cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 build --features wasi-http --locked
+      # Mirrors build-release.sh: Android ships Cranelift + wasi-http + typed-hosts
+      # (so the streaming + typed-capability entrypoints the Dart loader resolves
+      # are present in the .so). Compile + link the three ABIs only — no jniLibs
+      # staging, no execution.
+      - name: Cross-build jniLibs (Cranelift + wasi-http + typed-hosts)
+        run: cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 build --features "wasi-http typed-hosts" --locked
