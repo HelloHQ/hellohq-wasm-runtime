@@ -133,6 +133,21 @@ wasm-tools component new "$SE_CORE" -o "$SE_OUT"
 echo "Wrote $SE_OUT"
 wasm-tools component wit "$SE_OUT"
 
+# C1 TYPED workspace guest (workspace-run-guest world in wit/probe.wit): imports
+# ONLY the typed hellohq:plugin/workspace, exports `run() -> list<u8>` which calls
+# read-portfolio-names and returns "<id>=<name>;…". Drives the typed-host-over-P3
+# production test (tests/plugin_host_p3.rs), where the host forwards each typed
+# call over the P3 round-trip as the app's JSON wire. Isolated crate
+# test-guest-workspace-run.
+WSRUN_CORE="test-guest-workspace-run/target/wasm32-unknown-unknown/release/workspace_run_guest.wasm"
+WSRUN_OUT="tests/fixtures/workspace_run_guest.wasm"
+
+( cd test-guest-workspace-run && cargo build --release --target wasm32-unknown-unknown )
+wasm-tools component new "$WSRUN_CORE" -o "$WSRUN_OUT"
+
+echo "Wrote $WSRUN_OUT"
+wasm-tools component wit "$WSRUN_OUT"
+
 # CAPSTONE fixture (capstone_plugin.component.wasm): the real SDK-authored
 # quickstart plugin (plugin-sdk/examples/component-quickstart), NOT a hand-rolled
 # probe. Built with hellohq-plugin-sdk against the canonical hellohq:plugin WIT;

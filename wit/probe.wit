@@ -10,6 +10,17 @@ world workspace-probe {
   export read-names: func() -> list<portfolio-name>;
 }
 
+// C1 guest-side world for the typed-host-over-P3 production proof. A guest built
+// against this imports the typed `workspace` interface, calls
+// `read-portfolio-names`, and returns a BYTE summary via `run` (so it rides the
+// byte-oriented P3 result C ABI). The host (`plugin_host::TransportWorkspaceHost`)
+// forwards each typed call over the P3 round-trip to the app (Dart); the test
+// plays Dart via `hwr_p3_poll`/`hwr_p3_resolve`. NOT shipped to plugins.
+world workspace-run-guest {
+  import workspace;
+  export run: func() -> list<u8>;
+}
+
 // P3 substrate: the generic Dart-serviced host-call round-trip. A host import the
 // guest calls suspends the run; the request surfaces to the caller (Dart) via the
 // step/poll C ABI; the caller services it app-side (gated) and resolves the value;
