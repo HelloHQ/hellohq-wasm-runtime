@@ -10,10 +10,13 @@
 //! state satisfy both import sets — exactly what a real plugin needs to do gated
 //! outbound fetches alongside the typed capabilities.
 //!
-//! Runs on Cranelift and Pulley (the no-JIT iOS backend), behind the non-default
-//! `wasi-http` feature (the only build where the wasi:http host compiles).
+//! Runs on Cranelift and Pulley (the no-JIT iOS backend). Gated behind
+//! `wasi-http` (the wasi:http host) + `compile`: instantiating the portable
+//! fixture needs Cranelift, so under `--no-default-features --features wasi-http`
+//! (the CI no-JIT job) `Component::from_binary` is absent — matching the other
+//! portable-component tests (`http_handle.rs`, `capstone.rs`, …).
 
-#![cfg(feature = "wasi-http")]
+#![cfg(all(feature = "wasi-http", feature = "compile"))]
 
 use hellohq_wasm_runtime::capstone::CapstoneHarness;
 use hellohq_wasm_runtime::wasi_http::WasiHttpHost;
