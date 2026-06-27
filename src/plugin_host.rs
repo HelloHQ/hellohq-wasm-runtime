@@ -13,13 +13,16 @@
 //!
 //! So the guest sees fully typed imports (no `hostcall.call`) while
 //! `servicePluginHostCall` is reused UNCHANGED. `tests/workspace_transport.rs`
-//! proved the encode/decode in isolation; here it runs over the real P3
-//! transport, driven by `hwr_p3_start_workspace_compile` + the poll/resolve C ABI
-//! (`tests/plugin_host_p3.rs`).
+//! proved the encode/decode in isolation; `tests/plugin_host_p3.rs` runs it over
+//! the real P3 transport via `hwr_p3_start_workspace{,_compile}` + the
+//! poll/resolve C ABI.
 //!
-//! Slice scope: `read-portfolio-names` is wired end-to-end (the canonical first
-//! import); the other `workspace` reads follow the identical bridge and return a
-//! `not-found` api-error until later slices wire their JSON shapes.
+//! Scope: ALL five `workspace` reads are wired over the transport (each
+//! `decode_*` is unit-tested against the app's JSON shape; read-portfolio-names
+//! is additionally proven end-to-end over P3). `write-external-file` stays
+//! fail-closed (RESERVED in the WIT). `storage`/`events`/`log` are the next
+//! interfaces to wire (separate guest world); the `inference` streaming path
+//! already lives in `inference.rs`.
 
 use crate::P3Event;
 
@@ -29,8 +32,10 @@ wasmtime::component::bindgen!({
 });
 
 use hellohq::plugin::types::{
-    AggregatedSummary, ApiError, AssetCount, CurrencyRate, PortfolioName, SheetSummary,
+    AggregatedSummary, ApiError, AssetCount, CategoryCount, CategoryTotal, CurrencyRate,
+    PortfolioName, SheetInfo, SheetSummary,
 };
+use serde_json::Value;
 
 /// Host state for a typed `workspace` run: the P3 channel the typed imports
 /// forward over. `read-portfolio-names` becomes a JSON host-call the caller
@@ -52,15 +57,140 @@ impl TransportWorkspaceHost {
         pollster::block_on(rx).map_err(|_| transport_gone())
     }
 
-    /// Encode a no-argument typed read as the app's JSON host-call wire and
-    /// forward it.
-    fn forward_method(&self, method: &str) -> Result<Vec<u8>, ApiError> {
-        let request =
-            serde_json::to_vec(&serde_json::json!({ "method": method })).map_err(|e| ApiError {
-                code: "bad-request".to_string(),
-                message: e.to_string(),
-            })?;
-        self.call(request)
+    /// Encode a typed read as the app's JSON host-call wire
+    /// (`{"method":…,"portfolio_id":…?}`), forward it, and return the unwrapped
+    /// `data` value (or the typed `api-error` for `{"ok":false,…}`). The per-read
+    /// `decode_*` helpers shape `data` into the typed WIT record.
+    fn forward(&self, method: &str, portfolio_id: Option<&str>) -> Result<Value, ApiError> {
+        let mut req = serde_json::json!({ "method": method });
+        if let Some(pid) = portfolio_id {
+            req["portfolio_id"] = Value::from(pid);
+        }
+        let request = serde_json::to_vec(&req).map_err(|e| ApiError {
+            code: "bad-request".to_string(),
+            message: e.to_string(),
+        })?;
+        let resp = self.call(request)?;
+        let v: Value = serde_json::from_slice(&resp).map_err(|e| ApiError {
+            code: "bad-response".to_string(),
+            message: e.to_string(),
+        })?;
+        if v.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            Ok(v.get("data").cloned().unwrap_or(Value::Null))
+        } else {
+            // The app reports denial as `{"ok":false,"error":"denied:<perm>"}`;
+            // map it onto the typed `api-error` the WIT contract returns.
+            Err(ApiError {
+                code: "permission-denied".to_string(),
+                message: v
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("denied")
+                    .to_string(),
+            })
+        }
+    }
+}
+
+// ── JSON `data` -> typed WIT record decoders ─────────────────────────────────
+// The app's `servicePluginHostCall` returns `{"ok":true,"data":<X>}`; these map
+// `<X>` onto each `workspace` read's WIT result. Keys mirror the WIT record
+// fields (snake_case). Pure functions — unit-tested directly below.
+
+fn s(v: &Value, k: &str) -> String {
+    v.get(k)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn decode_portfolio_names(data: &Value) -> Vec<PortfolioName> {
+    data.as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|i| PortfolioName {
+                    id: s(i, "id"),
+                    name: s(i, "name"),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn decode_sheet_summary(data: &Value) -> SheetSummary {
+    SheetSummary {
+        portfolio_id: s(data, "portfolio_id"),
+        sheets: data
+            .get("sheets")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|sheet| SheetInfo {
+                        name: s(sheet, "name"),
+                        sections: sheet
+                            .get("sections")
+                            .and_then(Value::as_array)
+                            .map(|secs| {
+                                secs.iter()
+                                    .filter_map(|x| x.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn decode_asset_count(data: &Value) -> AssetCount {
+    AssetCount {
+        portfolio_id: s(data, "portfolio_id"),
+        count_by_category: data
+            .get("count_by_category")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|c| CategoryCount {
+                        category: s(c, "category"),
+                        count: c.get("count").and_then(Value::as_u64).unwrap_or(0) as u32,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn decode_currency_rates(data: &Value) -> Vec<CurrencyRate> {
+    data.as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|r| CurrencyRate {
+                    id: s(r, "id"),
+                    name: s(r, "name"),
+                    symbol: s(r, "symbol"),
+                    rate: r.get("rate").and_then(Value::as_f64).unwrap_or(0.0),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn decode_aggregated_summary(data: &Value) -> AggregatedSummary {
+    AggregatedSummary {
+        portfolio_id: s(data, "portfolio_id"),
+        totals: data
+            .get("totals")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|t| CategoryTotal {
+                        category: s(t, "category"),
+                        total: t.get("total").and_then(Value::as_f64).unwrap_or(0.0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -71,88 +201,46 @@ fn transport_gone() -> ApiError {
     }
 }
 
-fn not_wired(method: &str) -> ApiError {
-    ApiError {
-        code: "not-found".to_string(),
-        message: format!("{method}: not wired in this C1 slice (read-portfolio-names only)"),
-    }
-}
-
-/// Decode the app's `{"ok":true,"data":[{"id","name"}]}` /
-/// `{"ok":false,"error":…}` host-call reply into the typed
-/// `result<list<portfolio-name>, api-error>` the guest receives.
-fn decode_portfolio_names(resp: &[u8]) -> Result<Vec<PortfolioName>, ApiError> {
-    let v: serde_json::Value = serde_json::from_slice(resp).map_err(|e| ApiError {
-        code: "bad-response".to_string(),
-        message: e.to_string(),
-    })?;
-    if v.get("ok")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        let names = v
-            .get("data")
-            .and_then(serde_json::Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .map(|item| PortfolioName {
-                        id: item
-                            .get("id")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        name: item
-                            .get("name")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(names)
-    } else {
-        // The app reports denial as `{"ok":false,"error":"denied:<perm>"}`; map it
-        // onto the typed `api-error` the WIT contract returns to the guest.
-        let error = v
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("denied")
-            .to_string();
-        Err(ApiError {
-            code: "permission-denied".to_string(),
-            message: error,
-        })
-    }
-}
-
 impl hellohq::plugin::workspace::Host for TransportWorkspaceHost {
     fn read_portfolio_names(&mut self) -> Result<Vec<PortfolioName>, ApiError> {
-        let resp = self.forward_method("read:portfolio_names")?;
-        decode_portfolio_names(&resp)
+        self.forward("read:portfolio_names", None)
+            .map(|d| decode_portfolio_names(&d))
     }
 
-    fn read_sheet_structure(&mut self, _portfolio_id: String) -> Result<SheetSummary, ApiError> {
-        Err(not_wired("read-sheet-structure"))
+    fn read_sheet_structure(&mut self, portfolio_id: String) -> Result<SheetSummary, ApiError> {
+        self.forward("read:sheet_structure", Some(&portfolio_id))
+            .map(|d| decode_sheet_summary(&d))
     }
-    fn read_asset_count(&mut self, _portfolio_id: String) -> Result<AssetCount, ApiError> {
-        Err(not_wired("read-asset-count"))
+
+    fn read_asset_count(&mut self, portfolio_id: String) -> Result<AssetCount, ApiError> {
+        self.forward("read:asset_count", Some(&portfolio_id))
+            .map(|d| decode_asset_count(&d))
     }
+
     fn read_currency_rates(&mut self) -> Result<Vec<CurrencyRate>, ApiError> {
-        Err(not_wired("read-currency-rates"))
+        self.forward("read:currency_rates", None)
+            .map(|d| decode_currency_rates(&d))
     }
+
     fn read_aggregated_values(
         &mut self,
-        _portfolio_id: String,
+        portfolio_id: String,
     ) -> Result<AggregatedSummary, ApiError> {
-        Err(not_wired("read-aggregated-values"))
+        self.forward("read:aggregated_values", Some(&portfolio_id))
+            .map(|d| decode_aggregated_summary(&d))
     }
+
     fn write_external_file(
         &mut self,
         _filename: String,
         _content: Vec<u8>,
     ) -> Result<(), ApiError> {
-        Err(not_wired("write-external-file"))
+        // write:external_output is RESERVED in the WIT (no Tier-2 wiring); keep
+        // it fail-closed until the app side gains a typed write servicer.
+        Err(ApiError {
+            code: "not-found".to_string(),
+            message: "write-external-file: not wired (reserved capability)".to_string(),
+        })
     }
 }
 
@@ -179,4 +267,83 @@ pub(crate) fn drive_workspace_run(
     let mut store = wasmtime::Store::new(&engine, TransportWorkspaceHost { tx });
     let guest = WorkspaceRunGuest::instantiate(&mut store, &component, &linker).map_err(e2s)?;
     guest.call_run(&mut store).map_err(e2s)
+}
+
+// ── Decoder unit tests ───────────────────────────────────────────────────────
+// Each `workspace` read's `data` -> typed WIT record mapping, tested directly
+// against the JSON shape the app's `servicePluginHostCall` produces. The
+// read-portfolio-names path is additionally proven end-to-end over the real P3
+// transport in tests/plugin_host_p3.rs.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn decodes_portfolio_names() {
+        let data = json!([{"id": "pf-1", "name": "Growth"}, {"id": "pf-2", "name": "Income"}]);
+        let got = decode_portfolio_names(&data);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].id, "pf-1");
+        assert_eq!(got[1].name, "Income");
+    }
+
+    #[test]
+    fn decodes_sheet_summary() {
+        let data = json!({
+            "portfolio_id": "pf-1",
+            "sheets": [{"name": "Main", "sections": ["Assets", "Debts"]}],
+        });
+        let got = decode_sheet_summary(&data);
+        assert_eq!(got.portfolio_id, "pf-1");
+        assert_eq!(got.sheets.len(), 1);
+        assert_eq!(got.sheets[0].name, "Main");
+        assert_eq!(got.sheets[0].sections, vec!["Assets", "Debts"]);
+    }
+
+    #[test]
+    fn decodes_asset_count() {
+        let data = json!({
+            "portfolio_id": "pf-1",
+            "count_by_category": [{"category": "equities", "count": 3}],
+        });
+        let got = decode_asset_count(&data);
+        assert_eq!(got.portfolio_id, "pf-1");
+        assert_eq!(got.count_by_category.len(), 1);
+        assert_eq!(got.count_by_category[0].category, "equities");
+        assert_eq!(got.count_by_category[0].count, 3);
+    }
+
+    #[test]
+    fn decodes_currency_rates() {
+        let data = json!([{"id": "USD", "name": "US Dollar", "symbol": "$", "rate": 1.08}]);
+        let got = decode_currency_rates(&data);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "USD");
+        assert_eq!(got[0].symbol, "$");
+        assert!((got[0].rate - 1.08).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn decodes_aggregated_summary() {
+        let data = json!({
+            "portfolio_id": "pf-1",
+            "totals": [{"category": "equities", "total": 45000.5}],
+        });
+        let got = decode_aggregated_summary(&data);
+        assert_eq!(got.portfolio_id, "pf-1");
+        assert_eq!(got.totals.len(), 1);
+        assert_eq!(got.totals[0].category, "equities");
+        assert!((got.totals[0].total - 45000.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn missing_or_wrong_typed_fields_default_safely() {
+        // A malformed/absent `data` must not panic — fields default empty/zero.
+        assert!(decode_portfolio_names(&Value::Null).is_empty());
+        assert!(decode_currency_rates(&json!("not-an-array")).is_empty());
+        let empty = decode_sheet_summary(&json!({}));
+        assert_eq!(empty.portfolio_id, "");
+        assert!(empty.sheets.is_empty());
+    }
 }

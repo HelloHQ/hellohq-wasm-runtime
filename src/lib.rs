@@ -1069,6 +1069,42 @@ pub unsafe extern "C" fn hwr_p3_start_workspace_compile(
     .unwrap_or(std::ptr::null_mut())
 }
 
+/// As [hwr_p3_start_workspace_compile] but **deserializes** a precompiled
+/// component (the iOS no-JIT path — no Cranelift), mirroring [hwr_p3_start] vs
+/// [hwr_p3_start_compile]. Available in every build with `typed-hosts`.
+///
+/// # Safety
+/// `component` must point to `component_len` readable bytes produced by this
+/// runtime's precompile/serialize (the SHA-pinned-fetch trust boundary).
+#[cfg(feature = "typed-hosts")]
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3_start_workspace(
+    use_pulley: i32,
+    component: *const u8,
+    component_len: usize,
+) -> *mut HwrP3Session {
+    std::panic::catch_unwind(|| {
+        if component.is_null() {
+            return std::ptr::null_mut();
+        }
+        let comp_bytes = std::slice::from_raw_parts(component, component_len);
+        let engine = match p3_engine(use_pulley != 0) {
+            Ok(e) => e,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        // SAFETY: caller guarantees the bytes came from this runtime's
+        // precompile/serialize (the trust boundary is the SHA-pinned fetch).
+        let component = match wasmtime::component::Component::deserialize(&engine, comp_bytes) {
+            Ok(c) => c,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        Box::into_raw(Box::new(p3_run_session_sync(move |tx| {
+            crate::plugin_host::drive_workspace_run(engine, component, tx)
+        })))
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
 /// Block until the run yields a pending host call or finishes. Returns
 /// [HWR_P3_PENDING] / [HWR_P3_DONE] / [HWR_P3_ERROR].
 ///
