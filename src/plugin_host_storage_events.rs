@@ -11,16 +11,18 @@
 //!                                  reply `{"ok":true,"data":[u8…]|null}`
 //!   • `storage.delete/clear`    -> `{"method":"storage_delete|storage_clear",…}`
 //!   • `storage.list-keys()`     -> reply `{"ok":true,"data":["k1",…]}`
-//!   • `events.emit({kind,payload})` -> `{"method":"emit_event","name":…,"payload":[u8…]}`
+//!   • `events.emit({kind,payload})` -> `{"method":"emit_event","name":…,"payload":"<base64>"}`
 //!
-//! **Bytes are carried as JSON `u8` arrays** (binary-safe, no extra dep) — the
-//! typed `list<u8>` contract supersedes the interim string-only `storage_set`.
-//! Wiring the app side to this shape is C1-4 (the app cutover); here the contract
-//! is proven end-to-end over the real P3 transport against the existing
-//! `storage_events_guest` fixture, with the test playing Dart's servicer.
+//! **Bytes (`list<u8>`) are carried as a base64 STRING** (`plugin_host_bytes`):
+//! a string passes the app's existing G2 string-only `storage_set` unchanged and
+//! stays binary-safe, so the app's storage layer needs NO schema change — the
+//! host encodes/decodes transparently. Proven end-to-end over the real P3
+//! transport against the existing `storage_events_guest` fixture, with the test
+//! playing Dart's servicer.
 //!
 //! Gated behind `typed-hosts`. Driven by `hwr_p3_start_storage_events{,_compile}`.
 
+use crate::plugin_host_bytes::{b64_decode, b64_encode};
 use crate::P3Event;
 use serde_json::{json, Value};
 
@@ -42,17 +44,6 @@ fn api_err(code: &str, message: &str) -> ApiError {
         code: code.to_string(),
         message: message.to_string(),
     }
-}
-
-/// Decode a JSON `u8` array (the wire form for `list<u8>`) into bytes.
-fn decode_bytes(data: &Value) -> Vec<u8> {
-    data.as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|n| n.as_u64().map(|x| x as u8))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 impl TransportStorageEventsHost {
@@ -88,15 +79,20 @@ impl TransportStorageEventsHost {
 impl hellohq::plugin::storage::Host for TransportStorageEventsHost {
     fn get(&mut self, key: String) -> Result<Option<Vec<u8>>, ApiError> {
         let data = self.call(json!({ "method": "storage_get", "key": key }))?;
-        if data.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(decode_bytes(&data)))
+        match data.as_str() {
+            // Bytes ride the wire as a base64 string so the app's string-based
+            // servicer stores them unchanged (G2); decode back to `list<u8>`.
+            Some(b64) => b64_decode(b64)
+                .map(Some)
+                .ok_or_else(|| api_err("bad-response", "storage value was not valid base64")),
+            None => Ok(None), // null / absent key
         }
     }
 
     fn set(&mut self, key: String, value: Vec<u8>) -> Result<(), ApiError> {
-        self.call(json!({ "method": "storage_set", "key": key, "value": value }))?;
+        // Carry the `list<u8>` as a base64 STRING value: a string passes the
+        // app's G2 string-only `storage_set` unchanged, and stays binary-safe.
+        self.call(json!({ "method": "storage_set", "key": key, "value": b64_encode(&value) }))?;
         Ok(())
     }
 
@@ -125,11 +121,12 @@ impl hellohq::plugin::storage::Host for TransportStorageEventsHost {
 
 impl hellohq::plugin::events::Host for TransportStorageEventsHost {
     fn emit(&mut self, event: PluginEvent) -> Result<(), ApiError> {
-        // WIT `kind` maps onto the app's existing `emit_event` `name` field.
+        // WIT `kind` maps onto the app's existing `emit_event` `name` field; the
+        // `list<u8>` payload rides as a base64 string (binary-safe, app-unchanged).
         self.call(json!({
             "method": "emit_event",
             "name": event.kind,
-            "payload": event.payload,
+            "payload": b64_encode(&event.payload),
         }))?;
         Ok(())
     }
@@ -159,16 +156,5 @@ pub(crate) fn drive_storage_events_run(
     guest.call_run(&mut store).map_err(e2s)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decodes_u8_array_to_bytes() {
-        assert_eq!(decode_bytes(&json!([104, 101, 108, 108, 111])), b"hello");
-        assert!(decode_bytes(&Value::Null).is_empty());
-        assert!(decode_bytes(&json!("nope")).is_empty());
-        // Out-of-range / non-integer entries are dropped, not panicked on.
-        assert_eq!(decode_bytes(&json!([1, "x", 2])), vec![1u8, 2u8]);
-    }
-}
+// The byte ⇄ base64-string wire is covered by `plugin_host_bytes` (codec) and
+// end-to-end by `tests/plugin_host_storage_events_p3.rs` (over the real P3 path).

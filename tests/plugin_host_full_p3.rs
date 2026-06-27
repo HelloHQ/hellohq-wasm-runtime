@@ -82,31 +82,28 @@ fn method_of(v: &serde_json::Value) -> &str {
 /// Service the capstone plugin's calls, granting the workspace read. A tiny KV
 /// makes the storage round-trip genuine (get echoes what set stored).
 fn assert_granted(use_pulley: bool) {
-    let mut kv: HashMap<String, Vec<u8>> = HashMap::new();
-    let out =
-        run_with(use_pulley, |req| {
-            let v: serde_json::Value = serde_json::from_slice(req).expect("json request");
-            match method_of(&v) {
+    let mut kv: HashMap<String, String> = HashMap::new();
+    let out = run_with(use_pulley, |req| {
+        let v: serde_json::Value = serde_json::from_slice(req).expect("json request");
+        match method_of(&v) {
             // Two canned portfolios → the summary's first field is "2".
             "read:portfolio_names" => {
                 br#"{"ok":true,"data":[{"id":"p1","name":"Growth"},{"id":"p2","name":"Income"}]}"#
                     .to_vec()
             }
+            // Bytes ride the wire as a base64 STRING (so the app's string-based
+            // servicer is unchanged); the test's KV stores that string verbatim.
             "storage_set" => {
                 let key = v["key"].as_str().unwrap_or_default().to_string();
-                let value = v["value"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|n| n.as_u64().map(|x| x as u8)).collect())
-                    .unwrap_or_default();
+                let value = v["value"].as_str().unwrap_or_default().to_string();
                 kv.insert(key, value);
                 br#"{"ok":true}"#.to_vec()
             }
             "storage_get" => {
                 let key = v["key"].as_str().unwrap_or_default();
                 match kv.get(key) {
-                    Some(bytes) => {
-                        serde_json::to_vec(&serde_json::json!({ "ok": true, "data": bytes }))
-                            .unwrap()
+                    Some(b64) => {
+                        serde_json::to_vec(&serde_json::json!({ "ok": true, "data": b64 })).unwrap()
                     }
                     None => br#"{"ok":true,"data":null}"#.to_vec(),
                 }
@@ -114,8 +111,8 @@ fn assert_granted(use_pulley: bool) {
             "emit_event" | "log" => br#"{"ok":true}"#.to_vec(),
             other => panic!("unexpected method {other:?} (use_pulley={use_pulley})"),
         }
-        })
-        .expect("granted run succeeds");
+    })
+    .expect("granted run succeeds");
 
     // 2 portfolios, storage round-trip ok → "2|1".
     assert_eq!(
@@ -123,11 +120,9 @@ fn assert_granted(use_pulley: bool) {
         "2|1",
         "use_pulley={use_pulley}"
     );
-    // The plugin really stored greeting="hello" through the typed host.
-    assert_eq!(
-        kv.get("greeting").map(Vec::as_slice),
-        Some(b"hello".as_slice())
-    );
+    // The plugin really stored greeting="hello" through the typed host —
+    // carried as base64 ("hello" → "aGVsbG8=") so the app stores a plain string.
+    assert_eq!(kv.get("greeting").map(String::as_str), Some("aGVsbG8="));
 }
 
 /// Deny the gated workspace read; the plugin maps the api-error into its `run`

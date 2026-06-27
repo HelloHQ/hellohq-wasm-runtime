@@ -78,8 +78,9 @@ fn method_of(req: &[u8]) -> String {
 fn assert_round_trip(use_pulley: bool) {
     let mut list_keys_calls = 0u32;
     let out = run_with(use_pulley, |req| match method_of(req).as_str() {
-        // get("greeting") -> the bytes for "hello" as a JSON u8 array.
-        "storage_get" => br#"{"ok":true,"data":[104,101,108,108,111]}"#.to_vec(),
+        // get("greeting") -> "hello" as a base64 string (the byte wire form).
+        // base64("hello") == "aGVsbG8="; the host decodes it back to bytes.
+        "storage_get" => br#"{"ok":true,"data":"aGVsbG8="}"#.to_vec(),
         // First list-keys sees 2 keys, second (after delete) sees 1.
         "storage_list_keys" => {
             list_keys_calls += 1;
