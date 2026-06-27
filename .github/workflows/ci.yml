@@ -41,16 +41,20 @@ jobs:
       # wasi-http: the streaming network:fetch / ai:inference host impls + their
       # entrypoints (incl. the precompiled-streaming round-trip) only compile +
       # run under this feature. Covers tests/{http_handle,inference_complete,
-      # storage_events,streaming_precompiled}.rs.
-      - name: Streaming tests (--features wasi-http)
-        run: cargo test --features wasi-http --all-targets --locked
+      # storage_events,streaming_precompiled}.rs. typed-hosts is folded in here so
+      # the C1 typed-import bridge (src/plugin_host.rs, tests/{workspace_transport,
+      # plugin_host_p3}.rs + its decoder unit tests) is exercised too.
+      - name: Streaming + typed-host tests (--features "wasi-http typed-hosts")
+        run: cargo test --features "wasi-http typed-hosts" --all-targets --locked
 
       # iOS no-JIT path: runtime + Pulley only (no Cranelift / wat), WITH wasi-http
       # so the shipped iOS library links the no-Cranelift streaming entrypoints
-      # (hwr_p3s_start_*_precompiled). Scoped to --lib --tests; compile-gated tests
-      # compile out, the rest prove the iOS library links + its ABI.
-      - name: No-JIT build + tests (--no-default-features --features wasi-http)
-        run: cargo test --no-default-features --features wasi-http --lib --tests --locked
+      # (hwr_p3s_start_*_precompiled). typed-hosts here proves the typed-host stack
+      # (incl. hwr_p3_start_workspace, the precompiled C1 entrypoint) links on the
+      # iOS no-JIT slice. Scoped to --lib --tests; compile-gated tests compile out,
+      # the rest prove the iOS library links + its ABI.
+      - name: No-JIT build + tests (--no-default-features --features "wasi-http typed-hosts")
+        run: cargo test --no-default-features --features "wasi-http typed-hosts" --lib --tests --locked
 
   lint:
     name: fmt + clippy
