@@ -40,6 +40,21 @@ wasm-tools component new "$HTTP_CORE" -o "$HTTP_OUT"
 echo "Wrote $HTTP_OUT"
 wasm-tools component wit "$HTTP_OUT"
 
+# COMBINED capability + wasi:http guest (plugin-http-guest world in wit/probe.wit):
+# imports `hellohq:plugin/log` AND `wasi:http/{types,handler}`, exports async
+# `run` which writes a log line then does a GET and returns the status + body.
+# Proves the PRODUCTION `plugin` world's import combination (typed capabilities +
+# wasi:http) runs under one host linker. Isolated crate test-guest-plugin-http.
+# Drives the combined-world test (tests/plugin_http_world.rs).
+PLUGIN_HTTP_CORE="test-guest-plugin-http/target/wasm32-unknown-unknown/release/plugin_http_guest.wasm"
+PLUGIN_HTTP_OUT="tests/fixtures/plugin_http_guest.wasm"
+
+( cd test-guest-plugin-http && cargo build --release --target wasm32-unknown-unknown )
+wasm-tools component new "$PLUGIN_HTTP_CORE" -o "$PLUGIN_HTTP_OUT"
+
+echo "Wrote $PLUGIN_HTTP_OUT"
+wasm-tools component wit "$PLUGIN_HTTP_OUT"
+
 # Streaming-REQUEST-body (POST) guest (http-guest-post world in wit-wasi):
 # imports ONLY wasi:http/{types,handler}, exports `run` which builds a POST
 # request carrying a body stream ("req-body-123"), calls handler.handle, and
