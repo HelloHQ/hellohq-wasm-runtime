@@ -338,6 +338,22 @@ impl WasiHttpHost {
             |state| state,
         )
     }
+
+    /// Register the `wasi:http@0.3-rc` imports into a linker whose store state
+    /// `T` is NOT `WasiHttpHost` itself but EMBEDS one (reachable via `get`).
+    /// This is what lets a richer store state — e.g. one that ALSO carries a
+    /// `CapstoneHarness` to satisfy a plugin's `hellohq:plugin/*` capability
+    /// imports — provide `wasi:http` from the SAME store. It is the host-side
+    /// analogue of the production `plugin` world importing both the typed
+    /// capabilities AND `wasi:http/handler` (wit/world.wit): one component, one
+    /// store, both import sets satisfied. Mirrors
+    /// [`crate::capstone::CapstoneHarness::add_to_linker_get`].
+    pub fn add_to_linker_get<T: Send + 'static>(
+        linker: &mut wasmtime::component::Linker<T>,
+        get: fn(&mut T) -> &mut WasiHttpHost,
+    ) -> wasmtime::Result<()> {
+        HttpProbe::add_to_linker::<T, wasmtime::component::HasSelf<WasiHttpHost>>(linker, get)
+    }
 }
 
 // ─── wasi::clocks::types::Host — trivial (only the `duration` type alias) ────

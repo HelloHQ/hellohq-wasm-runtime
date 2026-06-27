@@ -1,0 +1,30 @@
+# Isolated guest crate proving the PRODUCTION `plugin` world's defining
+# combination: a guest that imports a `hellohq:plugin` capability (`log`) AND
+# standard `wasi:http` runs under one host linker. Built for
+# wasm32-unknown-unknown, turned into a component with wasm-tools, and committed
+# as a fixture at ../tests/fixtures/plugin_http_guest.wasm.
+#
+# The empty [workspace] table makes this its own workspace root so it never joins
+# the parent crate's build. Regen: see ../scripts/regen_probe_guest.sh.
+[workspace]
+
+[package]
+name = "plugin-http-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Guest-side bindings generator. Default features (async runtime + allocator
+# shim): the wasi:http world uses streams/futures + an async `handle`, and the
+# `run` export is async, so this guest needs the same async support as
+# test-guest-http (NOT the no_std/dlmalloc path the all-sync guests use).
+wit-bindgen = "0.58.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

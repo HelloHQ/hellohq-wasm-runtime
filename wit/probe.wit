@@ -62,3 +62,18 @@ world capstone-host {
   import log;
   export guest;
 }
+
+// Guest-side world proving the PRODUCTION `plugin` world's defining combination:
+// a guest that imports a `hellohq:plugin` capability (`log`) AND standard
+// `wasi:http` runs under ONE host linker (CapstoneHarness for the capability +
+// WasiHttpHost for outbound HTTP, on a single store). This is the shape a real
+// plugin uses to do gated outbound fetches alongside the typed capabilities now
+// that `world plugin` imports `wasi:http/handler` (world.wit). `run` is async
+// because it awaits the async `handler.handle` import and drains the response
+// body stream. NOT shipped to plugins — the real plugin world is `plugin`.
+world plugin-http-guest {
+  import log;
+  import wasi:http/types@0.3.0-rc-2026-01-06;
+  import wasi:http/handler@0.3.0-rc-2026-01-06;
+  export run: async func() -> list<u8>;
+}
