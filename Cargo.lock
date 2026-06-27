@@ -669,6 +669,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "pollster",
+ "serde_json",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",

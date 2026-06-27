@@ -77,6 +77,14 @@ pollster = "0.4.0"
 futures-channel = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+[dev-dependencies]
+# Test-only: the C1 typed-host-over-transport proof (tests/workspace_transport.rs)
+# encodes/decodes the app's existing JSON host-call wire to bridge the typed
+# `workspace` import <-> the Dart-serviced response. The shipped lib carries NO
+# JSON dep (the production bridge decides hand-rolled vs dep separately) — this
+# is dev-only so iOS binary size is unaffected.
+serde_json = "1"
+
 [features]
 # Desktop / Android / CI: in-process Cranelift compilation + `wat` parsing +
 # the async block_on executor. iOS builds with `--no-default-features` → runtime
