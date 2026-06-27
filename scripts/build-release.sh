@@ -69,17 +69,18 @@ zip_platform_dir() {
 # which the default feature provides, so it's Cranelift-only — iOS no-JIT can't
 # ship these.)
 build_jit() {
-  echo "→ cargo build --release --features wasi-http --target $1  (Cranelift + wasi-http)"
-  cargo build --release --features wasi-http --target "$1"
+  echo "→ cargo build --release --features \"wasi-http typed-hosts\" --target $1  (Cranelift + wasi-http + typed-hosts)"
+  cargo build --release --features "wasi-http typed-hosts" --target "$1"
 }
 
 # iOS: drop Cranelift. runtime + Pulley + component-model + async + std only.
 build_nojit() {
   # --features wasi-http ships the no-Cranelift streaming entrypoints
-  # (hwr_p3s_start_{http,inference}_precompiled) so the iOS slice can run the
-  # network:fetch / ai:inference transports from precompiled pulley64 artifacts.
-  echo "→ cargo build --release --no-default-features --features wasi-http --target $1  (Pulley, no JIT)"
-  cargo build --release --no-default-features --features wasi-http --target "$1"
+  # (hwr_p3s_start_{http,inference}_precompiled); typed-hosts adds the C1 typed
+  # capability entrypoints (hwr_p3_start_{workspace,storage_events,plugin}), all
+  # of which run from precompiled pulley64 artifacts on the iOS no-JIT slice.
+  echo "→ cargo build --release --no-default-features --features \"wasi-http typed-hosts\" --target $1  (Pulley, no JIT)"
+  cargo build --release --no-default-features --features "wasi-http typed-hosts" --target "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -94,8 +95,8 @@ build_android() {
   if [ -z "${ANDROID_NDK_HOME:-}" ]; then
     echo "⚠ ANDROID_NDK_HOME unset; skipping Android"; return 0
   fi
-  echo "→ cargo ndk → jniLibs (arm64-v8a, armeabi-v7a, x86_64)  (Cranelift + wasi-http)"
-  cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o "$STAGE/jniLibs" build --release --features wasi-http
+  echo "→ cargo ndk → jniLibs (arm64-v8a, armeabi-v7a, x86_64)  (Cranelift + wasi-http + typed-hosts)"
+  cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o "$STAGE/jniLibs" build --release --features "wasi-http typed-hosts"
   ( cd "$STAGE" && zip -qry jniLibs.zip jniLibs && rm -rf jniLibs )
 }
 
