@@ -24,3 +24,4 @@ ios-bench/Resources/*.cwasm
 /test-guest-inference/target
 /test-guest-plugin-http/target
 /test-guest-storage-events/target
+/test-guest-workspace-run/target

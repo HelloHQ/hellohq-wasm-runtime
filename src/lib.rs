@@ -101,6 +101,12 @@ pub mod wasi_guests;
 #[cfg(any(feature = "wasi-guests", feature = "wasi-guests-measure"))]
 pub mod fetch_gate;
 
+// C1: transport-backed TYPED capability hosts. Each typed import is forwarded
+// over the P3 round-trip to the app (Dart), bridging to/from the existing JSON
+// host-call wire. Behind `typed-hosts` (pulls serde_json); see the feature note.
+#[cfg(feature = "typed-hosts")]
+pub mod plugin_host;
+
 pub const HWR_ABI_VERSION: u32 = 1;
 
 // In-process Wasm compilation/execution requires Cranelift and is available only
@@ -756,7 +762,7 @@ pub const HWR_P3_PENDING: i32 = 1; // a host call awaits a value (read request, 
 pub const HWR_P3_DONE: i32 = 2; // run finished OK (read result)
 pub const HWR_P3_ERROR: i32 = 3; // run errored (result holds the message)
 
-enum P3Event {
+pub(crate) enum P3Event {
     HostCall {
         request: Vec<u8>,
         respond: futures_channel::oneshot::Sender<Vec<u8>>,
@@ -985,6 +991,80 @@ pub unsafe extern "C" fn hwr_p3_start_compile(
             Err(_) => return std::ptr::null_mut(),
         };
         Box::into_raw(Box::new(p3_run_session(engine, component, input_bytes)))
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+// ── C1: typed-import P3 sessions ─────────────────────────────────────────────
+//
+// The generic `hwr_p3_start*` above runs a guest that calls the opaque
+// `hostcall.call(bytes)->bytes` substrate. The typed path (C1) runs a guest that
+// imports the TYPED `hellohq:plugin/workspace` interface; each typed call is
+// forwarded over the SAME P3 round-trip (request out, `hwr_p3_resolve` in) by the
+// transport-backed host in `plugin_host`. The poll/resolve/result/free C ABI is
+// reused unchanged — only the worker's drive differs (a SYNC drive whose typed
+// host fns `block_on` the resolve oneshot), so this spawner runs the drive
+// directly instead of `pollster::block_on`-wrapping an async one.
+
+/// Spawn a worker thread running a SYNCHRONOUS drive `F` (whose host imports
+/// block on the caller's `hwr_p3_resolve`). Reuses [HwrP3Session] + the poll C
+/// ABI. The drive owns its engine/component; only byte buffers cross the channel.
+#[cfg(feature = "typed-hosts")]
+fn p3_run_session_sync<F>(drive: F) -> HwrP3Session
+where
+    F: FnOnce(std::sync::mpsc::Sender<P3Event>) -> Result<Vec<u8>, String> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel::<P3Event>();
+    let done_tx = tx.clone();
+    let thread = std::thread::spawn(move || {
+        let result = drive(tx);
+        let _ = done_tx.send(P3Event::Done(result));
+    });
+    HwrP3Session {
+        rx,
+        thread: Some(thread),
+        pending_request: Vec::new(),
+        pending_respond: None,
+        result: Vec::new(),
+        finished: false,
+    }
+}
+
+/// Start a TYPED `workspace` P3 run: compile a raw component (Cranelift) that
+/// imports `hellohq:plugin/workspace` and exports `run() -> list<u8>`, and begin
+/// executing it. Each typed `workspace` call the guest makes surfaces as a P3
+/// host-call (JSON `{"method":…}`) the caller services via [hwr_p3_resolve],
+/// exactly like the generic path — so `servicePluginHostCall` is reused. Drive
+/// with [hwr_p3_poll]/[hwr_p3_resolve]; free with [hwr_p3_free].
+///
+/// (Compile variant — the desktop/Android path + what the host tests use. The
+/// precompiled-deserialize variant for the iOS no-JIT slice is a follow-on.)
+///
+/// # Safety
+/// `component` must point to `component_len` readable bytes.
+#[cfg(all(feature = "typed-hosts", feature = "compile"))]
+#[no_mangle]
+pub unsafe extern "C" fn hwr_p3_start_workspace_compile(
+    use_pulley: i32,
+    component: *const u8,
+    component_len: usize,
+) -> *mut HwrP3Session {
+    std::panic::catch_unwind(|| {
+        if component.is_null() {
+            return std::ptr::null_mut();
+        }
+        let comp_bytes = std::slice::from_raw_parts(component, component_len);
+        let engine = match p3_engine(use_pulley != 0) {
+            Ok(e) => e,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let component = match wasmtime::component::Component::new(&engine, comp_bytes) {
+            Ok(c) => c,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        Box::into_raw(Box::new(p3_run_session_sync(move |tx| {
+            crate::plugin_host::drive_workspace_run(engine, component, tx)
+        })))
     })
     .unwrap_or(std::ptr::null_mut())
 }

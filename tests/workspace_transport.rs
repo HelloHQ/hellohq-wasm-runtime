@@ -18,8 +18,9 @@
 //! encode/decode bridge proven here is the reusable core.
 //!
 //! Gated behind `compile` (instantiating the portable fixture needs Cranelift,
-//! same as `workspace_probe.rs`); runs on both backends.
-#![cfg(feature = "compile")]
+//! same as `workspace_probe.rs`) + `typed-hosts` (the `serde_json` bridge dep);
+//! runs on both backends.
+#![cfg(all(feature = "compile", feature = "typed-hosts"))]
 
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store};

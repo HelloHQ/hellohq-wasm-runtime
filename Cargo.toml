@@ -76,14 +76,12 @@ pollster = "0.4.0"
 # (P3 v2) inbound channel.
 futures-channel = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-
-[dev-dependencies]
-# Test-only: the C1 typed-host-over-transport proof (tests/workspace_transport.rs)
-# encodes/decodes the app's existing JSON host-call wire to bridge the typed
-# `workspace` import <-> the Dart-serviced response. The shipped lib carries NO
-# JSON dep (the production bridge decides hand-rolled vs dep separately) — this
-# is dev-only so iOS binary size is unaffected.
-serde_json = "1"
+# C1 typed-host transport (`typed-hosts` feature): the production
+# transport-backed capability hosts bridge each typed import <-> the app's
+# existing JSON host-call wire. OPTIONAL + feature-gated so default /
+# `--no-default-features` (iOS no-JIT size budget) carry NO JSON dep — consistent
+# with the other typed-host modules being out of the base build.
+serde_json = { version = "1", optional = true }
 
 [features]
 # Desktop / Android / CI: in-process Cranelift compilation + `wat` parsing +
@@ -118,6 +116,13 @@ wasi-guests = ["wasi-http", "compile", "dep:wasmtime-wasi", "dep:wasmtime-wasi-h
 # running guests (instantiating a portable component needs `compile`); the
 # guest tests stay on `wasi-guests`. Out of default — purely a measurement knob.
 wasi-guests-measure = ["wasi-http", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http", "dep:hyper", "dep:http-body-util", "dep:bytes"]
+# C1 (typed Component-Model host imports in production): the transport-backed
+# capability hosts (`src/plugin_host.rs`) that forward each typed import over the
+# P3 round-trip to the app, bridging to/from the existing JSON host-call wire.
+# Pulls `serde_json` for that bridge. Non-default + out of `--no-default-features`
+# so the iOS no-JIT size budget is unaffected (the typed-host stack reaching the
+# iOS base build is a deliberate follow-on, like the other typed-host modules).
+typed-hosts = ["dep:serde_json"]
 
 # Examples gated by the features they need, so `cargo build --no-default-features
 # [--examples]` (the iOS no-JIT link check) never tries to compile a Cranelift-only
