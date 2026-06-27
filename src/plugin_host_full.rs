@@ -20,6 +20,7 @@
 //! bridge already proven in the per-capability modules and return a `not-found`
 //! api-error until folded in. Gated behind `typed-hosts`.
 
+use crate::plugin_host_bytes::{b64_decode, b64_encode};
 use crate::P3Event;
 use serde_json::{json, Value};
 
@@ -53,16 +54,6 @@ fn not_wired(method: &str) -> ApiError {
             "{method}: not wired in the C1 keystone (follows the proven per-capability bridge)"
         ),
     )
-}
-
-fn decode_bytes(data: &Value) -> Vec<u8> {
-    data.as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|n| n.as_u64().map(|x| x as u8))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 impl TransportPluginHost {
@@ -145,15 +136,18 @@ impl hellohq::plugin::workspace::Host for TransportPluginHost {
 impl hellohq::plugin::storage::Host for TransportPluginHost {
     fn get(&mut self, key: String) -> Result<Option<Vec<u8>>, ApiError> {
         let data = self.forward(json!({ "method": "storage_get", "key": key }))?;
-        if data.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(decode_bytes(&data)))
+        match data.as_str() {
+            // Bytes ride the wire as a base64 string (app's string-based servicer
+            // stores them unchanged, G2); decode back to `list<u8>`.
+            Some(b64) => b64_decode(b64)
+                .map(Some)
+                .ok_or_else(|| api_err("bad-response", "storage value was not valid base64")),
+            None => Ok(None),
         }
     }
 
     fn set(&mut self, key: String, value: Vec<u8>) -> Result<(), ApiError> {
-        self.forward(json!({ "method": "storage_set", "key": key, "value": value }))?;
+        self.forward(json!({ "method": "storage_set", "key": key, "value": b64_encode(&value) }))?;
         Ok(())
     }
 
@@ -173,7 +167,7 @@ impl hellohq::plugin::events::Host for TransportPluginHost {
         self.forward(json!({
             "method": "emit_event",
             "name": event.kind,
-            "payload": event.payload,
+            "payload": b64_encode(&event.payload),
         }))?;
         Ok(())
     }

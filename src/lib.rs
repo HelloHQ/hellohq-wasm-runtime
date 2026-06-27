@@ -107,6 +107,12 @@ pub mod fetch_gate;
 #[cfg(feature = "typed-hosts")]
 pub mod plugin_host;
 
+// C1: base64 codec for the typed-host byte bridge — `storage`/`events`
+// `list<u8>` values ride the JSON wire as a base64 string so the app's
+// string-based servicer (G2) stores them unchanged and binary-safe.
+#[cfg(feature = "typed-hosts")]
+mod plugin_host_bytes;
+
 // C1-3b: transport-backed typed `storage` + `events` hosts (companion of
 // `plugin_host`'s `workspace` host). Same `typed-hosts` gating + JSON wire.
 #[cfg(feature = "typed-hosts")]
