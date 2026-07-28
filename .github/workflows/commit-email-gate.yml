@@ -1,0 +1,143 @@
+name: commit-email-gate
+
+# Every commit landing in a HelloHQ repo must be authored AND committed under
+# an @hellohq.com address.
+#
+# The right mechanism is a GitHub org ruleset with a committer_email_pattern
+# rule — server-side, org-wide, no per-repo file. It is Enterprise-gated.
+# Verified empirically against this org on 2026-07-28 (Team plan): the API
+# accepts the ruleset, stores it as "active", and does not fire — a commit
+# authored calvin@calvinx.com pushed clean to both a private and a public
+# repo. The org keeps that ruleset in a DISABLED state, ready to enable the
+# day the plan changes; see docs/security/commit-identity-policy.md.
+#
+# So this workflow is the stand-in, and its limit is worth stating plainly:
+# it cannot REJECT a push. The bad commit is already on the branch by the
+# time this runs. What it gives you is a red run naming the offending SHA
+# and email, so the drift is caught in minutes instead of at an audit.
+#
+# ⚠️ VENDORED FILE — the canonical copy is hellohqworkspace/ci/commit-email-gate.yml.
+# Edit it there and re-run scripts/rollout_commit_email_gate.sh; a local edit
+# here is silently reverted by the next rollout.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  emails:
+    # Job name is stable so it can be promoted to a required status check if a
+    # repo ever adopts pull requests — that is the only way this becomes
+    # genuinely blocking without an Enterprise upgrade.
+    name: Committer identity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the range this job checks can start at any commit
+          # already on the remote, and a shallow clone would not contain it.
+          fetch-depth: 0
+
+      - name: Check commit identities
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          # Allowed identities:
+          #   *@hellohq.com                    humans and service accounts
+          #                                    (ci@hellohq.com — hqcore-ci,
+          #                                    contract-ci, hqenclave-ci)
+          #   noreply@github.com               GitHub itself: the committer on
+          #                                    web-UI edits and merge commits
+          #   *[bot]@users.noreply.github.com  Dependabot, github-actions, apps
+          #   actions@github.com               default identity of workflows
+          #                                    that commit via actions/checkout
+          #
+          # Deliberately NOT allowed: bare *@users.noreply.github.com. That is
+          # every GitHub user on earth, including a HelloHQ member who left
+          # their commit email private — which is precisely the drift this
+          # gate exists to catch. Team members set their address instead.
+          ALLOWED='(@hellohq\.com$|^noreply@github\.com$|\[bot\]@users\.noreply\.github\.com$|^actions@github\.com$)'
+
+          ZERO=0000000000000000000000000000000000000000
+
+          # Which commits are NEW in this push? Getting this wrong in the
+          # permissive direction (checking nothing) is the failure mode that
+          # matters, so every branch of this resolves to a real range or falls
+          # back to checking the tip.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git fetch --quiet origin "$BASE_REF"
+            RANGE="origin/${BASE_REF}..HEAD"
+          elif [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "$ZERO" ] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            RANGE="${BEFORE}..HEAD"
+          else
+            # New branch, force-push, or the very first push. Check whatever
+            # this ref adds on top of the default branch.
+            git fetch --quiet origin "$DEFAULT_BRANCH" 2>/dev/null || true
+            if git rev-parse --verify --quiet "origin/${DEFAULT_BRANCH}" >/dev/null \
+               && [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/${DEFAULT_BRANCH}")" ]; then
+              RANGE="origin/${DEFAULT_BRANCH}..HEAD"
+            else
+              RANGE=""
+            fi
+          fi
+
+          if [ -n "$RANGE" ] && COMMITS=$(git rev-list "$RANGE" 2>/dev/null); then
+            :
+          else
+            # Could not resolve a range (root commit, tag push, rewritten
+            # history). Check the tip rather than silently passing.
+            COMMITS=$(git rev-list -1 HEAD)
+            RANGE="(tip only)"
+          fi
+
+          echo "Checking range: $RANGE"
+
+          fail=0
+          count=0
+          for sha in $COMMITS; do
+            count=$((count + 1))
+            author=$(git log -1 --format='%ae' "$sha")
+            committer=$(git log -1 --format='%ce' "$sha")
+            subject=$(git log -1 --format='%s' "$sha")
+            for email in "$author" "$committer"; do
+              if ! printf '%s' "$email" | grep -qiE "$ALLOWED"; then
+                echo "::error::${sha:0:12} <${email}> — ${subject}"
+                fail=1
+              fi
+            done
+          done
+
+          echo "Checked $count commit(s)."
+
+          if [ "$fail" -ne 0 ]; then
+            cat >&2 <<'REMEDY'
+
+          ─────────────────────────────────────────────────────────────
+          Commit identity policy: every commit must be authored and
+          committed under an @hellohq.com address.
+
+          Fix your identity for all HelloHQ work at once (one-time):
+
+            git config --global --add includeIf.gitdir:~/hellohq/.path ~/hellohq/.gitconfig-hellohq
+            printf '[user]\n\temail = you@hellohq.com\n' > ~/hellohq/.gitconfig-hellohq
+
+          Also set the same address in GitHub → Settings → Emails, or
+          web-UI commits will keep carrying the noreply address.
+
+          Then rewrite the offending commits — for the most recent one:
+
+            git commit --amend --reset-author --no-edit && git push --force-with-lease
+
+          Policy: docs/security/commit-identity-policy.md
+          ─────────────────────────────────────────────────────────────
+          REMEDY
+            exit 1
+          fi
