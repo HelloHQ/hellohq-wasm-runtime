@@ -1,0 +1,39 @@
+version: 2
+
+# Dependabot VERSION updates. Security updates are a separate, repo-level
+# setting (`automated-security-fixes`) and are already on — this file does not
+# control them and cannot turn them off.
+#
+# Added 2026-08-09 when Renovate was removed org-wide.
+#
+# Only the root crate is watched. test-guest-http-02/ and test-guest-http-post/
+# have their own Cargo.toml but are WASM test fixtures compiled by the suite —
+# bumping their deps changes what the tests exercise without shipping anything.
+#
+# This crate embeds Wasmtime and executes untrusted plugin components, so a
+# Wasmtime bump is a sandbox-boundary change, not a routine dependency bump.
+# Read the release notes; the whole security property of the plugin system rests
+# on that isolation holding.
+
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["deps"]
+    groups:
+      rust-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["deps"]
+    groups:
+      actions-minor-and-patch:
+        update-types: ["minor", "patch"]
