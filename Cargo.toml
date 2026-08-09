@@ -56,7 +56,7 @@ wasmtime-wasi = { version = "45", optional = true }
 # all (the safe default). Same heavy-deps / feature-gating story as
 # `wasmtime-wasi` (tokio, hyper, cap-std), so it rides the `wasi-guests`
 # feature only — default / `--no-default-features` (iOS no-JIT) stay unaffected.
-wasmtime-wasi-http = { version = "45", optional = true }
+wasmtime-wasi-http = { version = "46", optional = true }
 # Only used to name the `hyper::Request` type in the gated
 # `GatedHttpHooks::send_request` signature (the request body type comes from
 # `wasmtime-wasi-http`). Version-matched to what `wasmtime-wasi-http@45` pulls in
