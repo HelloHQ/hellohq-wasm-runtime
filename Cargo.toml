@@ -46,7 +46,7 @@ wasmtime = { version = "45.0.1", default-features = false, features = [
 # stay unaffected. Pinned to 45 so its WASI 0.2 interfaces match wasmtime 45's
 # component-model ABI (a version mismatch fails to compile / links the wrong
 # wasi version).
-wasmtime-wasi = { version = "45", optional = true }
+wasmtime-wasi = { version = "46", optional = true }
 # WASI 0.2 `wasi:http` host, version-matched to `wasmtime` (45). JS (jco)
 # components import `wasi:http@0.2` as part of the engine baseline even when
 # unused, so the interface must be PRESENT to instantiate. We register it behind
