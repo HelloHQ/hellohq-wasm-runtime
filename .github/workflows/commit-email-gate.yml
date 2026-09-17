@@ -35,7 +35,7 @@ jobs:
     name: Committer identity
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history: the range this job checks can start at any commit
           # already on the remote, and a shallow clone would not contain it.
