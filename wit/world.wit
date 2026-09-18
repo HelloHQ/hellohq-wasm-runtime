@@ -102,7 +102,7 @@ interface log {
 // Routes through HQAuthProxy on the MAIN isolate. Constrained request/response,
 // NOT direct model/Astrocyte access. No secret, key, raw memory, credential id,
 // or request id ever crosses this boundary. Async at the canonical-ABI level
-// (proven on Wasmtime 45, doc 53 §6.1); expressed here as a plain func because
+// (proven on Wasmtime 46, doc 53 §6.1); expressed here as a plain func because
 // WIT-level `async` is still unstable — the async lowering is applied at the
 // canon layer, not the interface text.
 interface inference {

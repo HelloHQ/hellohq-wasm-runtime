@@ -111,8 +111,10 @@ impl hellohq::plugin::types::Host for InferenceHost {}
 // ── Token framing (inbound, caller → host) ───────────────────────────────────
 // Each inbound P3 frame is ONE UTF-8 token-delta string → one `stream<string>`
 // element. Inbound close (push_end) → the stream ends.
-impl hellohq::plugin::inference::HostWithStore for wasmtime::component::HasSelf<InferenceHost> {
-    fn complete<T>(
+impl<T> hellohq::plugin::inference::HostWithStore<T>
+    for wasmtime::component::HasSelf<InferenceHost>
+{
+    fn complete(
         mut host: wasmtime::component::Access<T, Self>,
         messages: Vec<ChatMessage>,
         opts: InferenceOpts,
