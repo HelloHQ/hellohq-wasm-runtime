@@ -51,11 +51,11 @@ use wasmtime::{Config, Engine, Store};
 wasmtime::component::bindgen!({
     path: "wit",
     world: "capstone-host",
-    // wasmtime 45 async config: the generated export accessors must be the
+    // wasmtime 46 async config: the generated export accessors must be the
     // `_async` variants (`call_run_async` + `instantiate_async`) because the
     // linker registers async WASI host funcs (`add_to_linker_async`), so the
     // call goes through the async path. (`async: true` is the OLD spelling and
-    // is rejected by the 45 macro.)
+    // is rejected by the 45+ macro.)
     imports: { default: async },
     exports: { default: async },
 });

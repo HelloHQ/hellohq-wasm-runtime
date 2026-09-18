@@ -642,8 +642,8 @@ impl wasi::http::types::HostRequest for WasiHttpHost {
 // (`false`) — failing instantiation with "type mismatch with async". So `store`
 // alone is the correct flag for these sync-but-stream-minting methods.
 
-impl wasi::http::types::HostRequestWithStore for wasmtime::component::HasSelf<WasiHttpHost> {
-    fn new<T>(
+impl<T> wasi::http::types::HostRequestWithStore<T> for wasmtime::component::HasSelf<WasiHttpHost> {
+    fn new(
         mut host: wasmtime::component::Access<T, Self>,
         headers: wasmtime::component::Resource<Fields>,
         contents: Option<wasmtime::component::StreamReader<u8>>,
@@ -678,7 +678,7 @@ impl wasi::http::types::HostRequestWithStore for wasmtime::component::HasSelf<Wa
         )
     }
 
-    fn consume_body<T>(
+    fn consume_body(
         mut host: wasmtime::component::Access<T, Self>,
         this: wasmtime::component::Resource<Request>,
         res: wasmtime::component::FutureReader<Result<(), ErrorCode>>,
@@ -765,8 +765,8 @@ impl wasi::http::types::HostResponse for WasiHttpHost {
 
 // ─── wasi::http::types::HostResponseWithStore — stream-minting methods ────────
 
-impl wasi::http::types::HostResponseWithStore for wasmtime::component::HasSelf<WasiHttpHost> {
-    fn new<T>(
+impl<T> wasi::http::types::HostResponseWithStore<T> for wasmtime::component::HasSelf<WasiHttpHost> {
+    fn new(
         mut host: wasmtime::component::Access<T, Self>,
         headers: wasmtime::component::Resource<Fields>,
         contents: Option<wasmtime::component::StreamReader<u8>>,
@@ -794,7 +794,7 @@ impl wasi::http::types::HostResponseWithStore for wasmtime::component::HasSelf<W
         )
     }
 
-    fn consume_body<T>(
+    fn consume_body(
         mut host: wasmtime::component::Access<T, Self>,
         this: wasmtime::component::Resource<Response>,
         res: wasmtime::component::FutureReader<Result<(), ErrorCode>>,
@@ -933,8 +933,8 @@ impl wasi::http::types::Host for WasiHttpHost {}
 // taking an `Accessor`. STAGE 1 returns a clean error rather than panicking.
 impl wasi::http::handler::Host for WasiHttpHost {}
 
-impl wasi::http::handler::HostWithStore for wasmtime::component::HasSelf<WasiHttpHost> {
-    async fn handle<T: Send>(
+impl<T: Send> wasi::http::handler::HostWithStore<T> for wasmtime::component::HasSelf<WasiHttpHost> {
+    async fn handle(
         accessor: &wasmtime::component::Accessor<T, Self>,
         request: wasmtime::component::Resource<Request>,
     ) -> Result<wasmtime::component::Resource<Response>, ErrorCode> {

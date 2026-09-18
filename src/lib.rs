@@ -24,7 +24,7 @@
 //! - `hwr_precompile_component` / `hwr_free_bytes` — off-device AOT (P1).
 //! - `hwr_run_async_double` / `_component_async_double` / `_canonical_async_double`
 //!   — async host imports + the canonical async ABI (`task.return`), on
-//!   Wasmtime 45 (no 46 needed; see hellohq doc 53 §6.1).
+//!   Wasmtime 46 (see hellohq doc 53 §6.1).
 //! - `hwr_read_portfolio_count` — gated `workspace` host import against the doc-53
 //!   WIT world (`wit/world.wit`), the gate as chokepoint (P2 Option A).
 //! - **P2 Option A complete:** typed `list<portfolio-name>` round-trips
@@ -369,13 +369,18 @@ const CANON_ASYNC_WAT: &str = r#"(component
       (i32.const 0)))
   (core instance $i (instantiate $m
     (with "" (instance (export "task-return" (func $task_return))))))
-  (func (export "run") (param "x" u32) (result u32)
+  (func (export "run") async (param "x" u32) (result u32)
     (canon lift (core func $i "run") async (callback (func $i "cb")))))"#;
 
 /// Instantiates [CANON_ASYNC_WAT] and drives the **async-lifted** export with
 /// `call_async` (`wasm_component_model_async(true)`). Proves the canonical async
 /// lift — the `wasi:http` streaming substrate — compiles and runs on Wasmtime
-/// **45** under both backends. Returns `2·x`.
+/// **46** under both backends. Returns `2·x`.
+///
+/// NOTE: the component-level func type is declared `async` (`(func … async …)`).
+/// Wasmtime 46's validator (wasmparser 0.251) requires the `async` canonical
+/// lift option to sit on an async-typed component function; on 45 the plain
+/// (sync) type was still accepted.
 #[cfg(feature = "compile")]
 async fn run_canonical_async_double(use_pulley: bool, x: u32) -> wasmtime::Result<u32> {
     use wasmtime::component::{Component, Linker};
@@ -502,7 +507,7 @@ pub extern "C" fn hwr_run_async_double(use_pulley: i32, x: i32) -> i64 {
 }
 
 /// As [hwr_run_async_double] but the async import runs under a **component** ABI
-/// with Component Model Async enabled (Wasmtime 45, `component-model-async`).
+/// with Component Model Async enabled (Wasmtime 46, `component-model-async`).
 /// Proves the async component path — the basis for async `ai:inference` /
 /// `wasi:http` host imports (doc 53) — works on the shipped runtime version.
 /// Returns `2·x`, or `i64::MIN` on error.
@@ -523,7 +528,7 @@ pub extern "C" fn hwr_run_component_async_double(use_pulley: i32, x: i32) -> i64
 
 /// Drives the **canonical async-lift** component ([run_canonical_async_double])
 /// across the C ABI — the `wasi:http`/stream/future substrate (`task.return` +
-/// callback) proven on Wasmtime 45. Returns `2·x`, or `i64::MIN` on error.
+/// callback) proven on Wasmtime 46. Returns `2·x`, or `i64::MIN` on error.
 ///
 /// # Safety
 /// None — takes no pointers.
@@ -1926,7 +1931,7 @@ mod tests {
     #[cfg(feature = "compile")]
     #[test]
     fn cranelift_component_async() {
-        // Component Model Async on Wasmtime 45: async host import under a
+        // Component Model Async on Wasmtime 46: async host import under a
         // component ABI with wasm_component_model_async(true).
         assert_eq!(
             pollster::block_on(run_component_async_double(false, 21)).unwrap(),
