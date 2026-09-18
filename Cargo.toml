@@ -69,7 +69,7 @@ hyper = { version = "1", optional = true }
 # so default / `--no-default-features` (iOS no-JIT) stay unaffected.
 http-body-util = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
-pollster = "0.4.0"
+pollster = "1.0.1"
 # Oneshot + mpsc channels for the P3 round-trip: the host import awaits a value
 # the caller (Dart) supplies via `hwr_p3_resolve`/streaming push from another
 # thread. `futures-util` gives the async `StreamExt::next` for the streaming
