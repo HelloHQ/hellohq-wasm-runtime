@@ -7,7 +7,7 @@ name: commit-email-gate
 # rule — server-side, org-wide, no per-repo file. It is Enterprise-gated.
 # Verified empirically against this org on 2026-07-28 (Team plan): the API
 # accepts the ruleset, stores it as "active", and does not fire — a commit
-# authored calvin@calvinx.com pushed clean to both a private and a public
+# authored with a non-@hellohq.com address pushed clean to both a private and a public
 # repo. The org keeps that ruleset in a DISABLED state, ready to enable the
 # day the plan changes; see docs/security/commit-identity-policy.md.
 #
