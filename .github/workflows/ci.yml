@@ -47,6 +47,14 @@ jobs:
       - name: Streaming + typed-host tests (--features "wasi-http typed-hosts")
         run: cargo test --features "wasi-http typed-hosts" --all-targets --locked
 
+      # wasi-guests: the wasi:*@0.2 surface for JS (jco) / Go (TinyGo) guests and
+      # its gated wasi:http@0.2 path (src/{wasi_guests,fetch_gate}.rs) — the one
+      # outbound path that never reaches the app, so its fetch gate + plugin
+      # request policy are tested here: tests/{go_guest,http02_guest,js_guest}.rs
+      # and the module unit tests (incl. a loopback no-redirect check).
+      - name: JS/Go guest tests (--features "wasi-guests typed-hosts")
+        run: cargo test --features "wasi-guests typed-hosts" --all-targets --locked
+
       # iOS no-JIT path: runtime + Pulley only (no Cranelift / wat), WITH wasi-http
       # so the shipped iOS library links the no-Cranelift streaming entrypoints
       # (hwr_p3s_start_*_precompiled). typed-hosts here proves the typed-host stack
@@ -66,6 +74,9 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      # wasi-guests implies wasi-http + compile, so this also lints the
+      # streaming hosts; typed-hosts adds the C1 bridge.
+      - run: cargo clippy --features "wasi-guests typed-hosts" --all-targets --locked -- -D warnings
 
   build-ios:
     name: Cross-build · iOS (no-JIT)

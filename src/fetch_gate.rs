@@ -38,6 +38,12 @@ pub enum FetchDenial {
     /// The host is an IP literal in the private / loopback / link-local /
     /// metadata block set (SSRF).
     AddressBlocked,
+    /// The request carries the reserved credential-handle header
+    /// ([`crate::request_policy::RESERVED_CREDENTIAL_HEADER`]). Doc 30 §4.6:
+    /// the in-host `wasi:http@0.2` path never carries credentials, so such a
+    /// request is refused outright (`credential_unsupported_transport`) rather
+    /// than sent with the header dropped.
+    CredentialUnsupportedTransport,
 }
 
 /// True when `ip` is **not** a public, routable address — the set

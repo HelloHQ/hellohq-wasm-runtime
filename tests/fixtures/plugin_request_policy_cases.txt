@@ -1,0 +1,87 @@
+# Plugin outbound-request header policy: the shared case table.
+#
+# CANONICAL COPY: hellohq-wasm-runtime tests/fixtures/plugin_request_policy_cases.txt
+# VENDORED COPY:  hellohq test/fixtures/plugin_request_policy_cases.txt (byte-identical)
+#
+# Read by BOTH policy implementations' tests:
+#   - Rust: src/request_policy.rs (shared_case_table_*), applied on the in-host
+#     wasi:http@0.2 path (src/wasi_guests.rs GatedHttpHooks);
+#   - Dart: hellohq lib/app/utils/service/plugin_request_policy.dart
+#     (PluginRequestPolicy), applied in PluginNetworkService.fetch.
+# Change the policy in both repos and this table together; whichever side was
+# not updated fails its test.
+#
+# Format: one case per line, "<expectation> <header-name>". Names are matched
+# case-insensitively, so mixed case here is deliberate.
+#   keep             request header a plugin may set; sent as-is. Exactly the
+#                    allowlist, one row per allowlisted name.
+#   drop-credential  request header dropped AND classified as a credential
+#   drop             request header dropped, not credential-looking
+#   response-strip   response header removed before the plugin sees it
+#   response-keep    response header passed through
+
+# The allowlist (doc 30 §2.2 plus Accept-Language).
+keep Accept
+keep accept-language
+keep Content-Type
+keep IF-NONE-MATCH
+keep If-Modified-Since
+
+# Named credential headers (doc 30 §2.2 "host-only").
+drop-credential Authorization
+drop-credential Proxy-Authorization
+drop-credential Cookie
+drop-credential X-API-Key
+drop-credential API-Key
+drop-credential API-Sign
+drop-credential CB-ACCESS-KEY
+drop-credential CB-ACCESS-SIGN
+drop-credential CB-ACCESS-TIMESTAMP
+drop-credential CB-ACCESS-PASSPHRASE
+drop-credential OK-ACCESS-KEY
+drop-credential OK-ACCESS-SIGN
+drop-credential OK-ACCESS-TIMESTAMP
+drop-credential OK-ACCESS-PASSPHRASE
+drop-credential X-MBX-APIKEY
+
+# Credential patterns: a prefix, or a name containing auth, cookie, key,
+# secret, sign, token, passphrase, password, session or cert.
+drop-credential cb-access-anything
+drop-credential ok-access-anything
+drop-credential X-Auth-Token
+drop-credential X-Custom-Secret
+drop-credential X-Signature
+drop-credential Access-Token
+drop-credential AccessKey
+drop-credential Token
+drop-credential X-Passphrase
+drop-credential X-Session-Id
+drop-credential X-Password
+drop-credential X-Client-Cert
+drop-credential X-Api-Key-Id
+drop-credential X-Cookie-Consent
+drop-credential WWW-Authenticate
+
+# Host-controlled and unknown headers.
+drop Host
+drop Content-Length
+drop Transfer-Encoding
+drop Connection
+drop User-Agent
+drop X-Request-Id
+drop Origin
+drop Referer
+drop Accept-Encoding
+drop Cache-Control
+drop X-Forwarded-For
+# The reserved credential-handle header (doc 30 §4.6) is not allowlisted. The
+# in-host wasi:http@0.2 path goes further and refuses the whole request.
+drop x-hellohq-credential
+
+# Response headers.
+response-strip Set-Cookie
+response-strip set-cookie2
+response-strip SET-COOKIE
+response-keep content-type
+response-keep etag
+response-keep Cache-Control

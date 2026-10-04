@@ -101,6 +101,14 @@ pub mod wasi_guests;
 #[cfg(any(feature = "wasi-guests", feature = "wasi-guests-measure"))]
 pub mod fetch_gate;
 
+// The plugin outbound-request header policy (strict request-header allowlist,
+// credential-name patterns, Set-Cookie stripping) — a port of the hellohq app's
+// `PluginRequestPolicy`, applied by `wasi_guests`'s `GatedHttpHooks` on the
+// in-host `wasi:http@0.2` path. Plain Rust with no dependencies, so it is in
+// every build: its tests (including the case table shared with the Dart suite)
+// then run in every CI job, not only under `wasi-guests`.
+pub mod request_policy;
+
 // C1: transport-backed TYPED capability hosts. Each typed import is forwarded
 // over the P3 round-trip to the app (Dart), bridging to/from the existing JSON
 // host-call wire. Behind `typed-hosts` (pulls serde_json); see the feature note.

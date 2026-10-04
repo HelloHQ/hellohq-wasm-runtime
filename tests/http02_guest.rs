@@ -149,3 +149,134 @@ fn deny_empty_allowlist() {
     );
     assert!(!reached, "send must not be reached on empty-allowlist deny");
 }
+
+// ─── Plugin request policy, observed from a real guest ───────────────────────
+//
+// `run-with-headers` sets request headers before sending and reports the
+// response header names it can see. The injected sender records the headers it
+// was handed and answers with cookie-setting headers, so one run checks both
+// halves of the policy: what may leave the host, and what the guest gets back.
+
+use hellohq_wasm_runtime::wasi_guests::{canned_response_sender, SeenHeaders};
+
+type HeadersResult = Result<(u16, Vec<String>), u8>;
+
+async fn run_with_headers_async(
+    headers: &[(&str, &str)],
+    response_headers: &[(&str, &str)],
+    seen: SeenHeaders,
+) -> wasmtime::Result<HeadersResult> {
+    let engine = async_engine()?;
+    let component = Component::from_binary(&engine, GUEST)?;
+    let mut linker = Linker::<GoGuestState>::new(&engine);
+    GoGuestState::add_full_to_linker(&mut linker)?;
+
+    let state = GoGuestState::with_origins_and_sender(
+        true,
+        vec!["api.example.com".to_string()],
+        canned_response_sender(
+            200,
+            response_headers
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            seen,
+        ),
+    );
+    let mut store = Store::new(&engine, state);
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let run = instance.get_typed_func::<(String, Vec<(String, String)>), (HeadersResult,)>(
+        &mut store,
+        "run-with-headers",
+    )?;
+    let headers = headers
+        .iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect();
+    let (result,) = run
+        .call_async(&mut store, ("api.example.com".to_string(), headers))
+        .await?;
+    Ok(result)
+}
+
+fn run_with_headers(
+    headers: &[(&str, &str)],
+    response_headers: &[(&str, &str)],
+) -> (HeadersResult, Option<Vec<(String, String)>>) {
+    let seen: SeenHeaders = Default::default();
+    let result = pollster::block_on(run_with_headers_async(
+        headers,
+        response_headers,
+        seen.clone(),
+    ))
+    .unwrap_or_else(|e| panic!("guest run failed: {e:?}"));
+    let seen = seen.lock().unwrap().clone();
+    (result, seen)
+}
+
+/// Credential and unknown headers a guest sets never reach the sender; the
+/// allowlisted ones do. `Set-Cookie`/`Set-Cookie2` never reach the guest.
+#[test]
+fn guest_headers_cut_to_allowlist_and_set_cookie_stripped() {
+    let (result, seen) = run_with_headers(
+        &[
+            ("Authorization", "Bearer secret"),
+            ("Cookie", "session=secret"),
+            ("X-API-Key", "secret"),
+            ("CB-ACCESS-SIGN", "secret"),
+            ("X-MBX-APIKEY", "secret"),
+            // Forbidden by wasmtime-wasi-http itself: the guest's append fails.
+            ("Proxy-Authorization", "Basic c2VjcmV0"),
+            ("User-Agent", "plugin/1.0"),
+            ("X-Request-Id", "abc"),
+            ("Accept", "application/json"),
+            ("Content-Type", "application/json"),
+        ],
+        &[
+            ("content-type", "application/json"),
+            ("set-cookie", "session=abc; HttpOnly"),
+            ("set-cookie2", "legacy=1"),
+            ("etag", "\"v1\""),
+        ],
+    );
+
+    let mut seen = seen.expect("an allowed request must reach the sender");
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("accept".to_string(), "application/json".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ],
+        "only allowlisted request headers may leave the host"
+    );
+
+    let (status, mut names) = result.expect("allowed request must succeed");
+    assert_eq!(status, 200);
+    names.sort();
+    assert_eq!(
+        names,
+        ["content-type", "etag"],
+        "Set-Cookie must not reach the guest"
+    );
+}
+
+/// Doc 30 §4.6: a request carrying the reserved credential-handle header is
+/// refused on this transport — the guest sees `HttpRequestDenied` and the
+/// sender is never reached.
+#[test]
+fn guest_credential_handle_header_refused() {
+    let (result, seen) = run_with_headers(
+        &[
+            ("x-hellohq-credential", "handle-1"),
+            ("Accept", "application/json"),
+        ],
+        &[],
+    );
+    assert_eq!(
+        result,
+        Err(2),
+        "credential handle must be refused (HttpRequestDenied)"
+    );
+    assert!(seen.is_none(), "send must not be reached");
+}

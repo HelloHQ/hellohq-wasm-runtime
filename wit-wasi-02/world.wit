@@ -17,4 +17,10 @@ world http02-guest {
   // authority e.g. "api.example.com"; use-https chooses the scheme.
   // Ok(status-code) on a response; Err(code) on denial/error (see lib.rs).
   export run: func(authority: string, use-https: bool) -> result<u16, u8>;
+  // Plugin request-policy proof: like `run` (https), but first sets each of
+  // `headers` on the request — skipping any the host refuses to set (a
+  // forbidden name) — and on a response returns the status plus the response
+  // header names the guest can see. Same Err codes as `run`.
+  export run-with-headers: func(authority: string, headers: list<tuple<string, string>>)
+    -> result<tuple<u16, list<string>>, u8>;
 }

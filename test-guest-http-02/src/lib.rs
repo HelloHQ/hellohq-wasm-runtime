@@ -35,52 +35,83 @@ wit_bindgen::generate!({
 });
 
 use wasi::http::outgoing_handler;
-use wasi::http::types::{ErrorCode, Fields, OutgoingRequest, Scheme};
+use wasi::http::types::{ErrorCode, Fields, IncomingResponse, OutgoingRequest, Scheme};
 
 struct Component;
 
-impl Guest for Component {
-    fn run(authority: String, use_https: bool) -> Result<u16, u8> {
-        let headers = Fields::new();
-        let req = OutgoingRequest::new(headers);
+/// Send a GET to `{scheme}://{authority}/` carrying `headers`, block on the
+/// response, and hand it to `on_response`. Error codes as in the module docs.
+fn send<T>(
+    authority: &str,
+    use_https: bool,
+    headers: Fields,
+    on_response: impl FnOnce(IncomingResponse) -> T,
+) -> Result<T, u8> {
+    let req = OutgoingRequest::new(headers);
 
-        let scheme = if use_https {
-            Scheme::Https
-        } else {
-            Scheme::Http
-        };
-        req.set_scheme(Some(&scheme)).unwrap();
-        req.set_authority(Some(&authority)).unwrap();
-        req.set_path_with_query(Some("/")).unwrap();
+    let scheme = if use_https {
+        Scheme::Https
+    } else {
+        Scheme::Http
+    };
+    req.set_scheme(Some(&scheme)).unwrap();
+    req.set_authority(Some(authority)).unwrap();
+    req.set_path_with_query(Some("/")).unwrap();
 
-        // Dispatch. A `handle()`-level Err means the request was rejected before
-        // a future was even produced — which is exactly how this host surfaces a
-        // gate denial. Map the denial code so it stays distinguishable.
-        let fut = match outgoing_handler::handle(req, None) {
-            Ok(f) => f,
-            Err(ec) => {
-                return Err(if matches!(ec, ErrorCode::HttpRequestDenied) {
-                    2
-                } else {
-                    1
-                })
-            }
-        };
-
-        // Block the (sync) guest until the response future is ready; Wasmtime
-        // drives the host's async send underneath.
-        let pollable = fut.subscribe();
-        pollable.block();
-
-        match fut.get() {
-            Some(Ok(Ok(resp))) => Ok(resp.status()),
-            Some(Ok(Err(ec))) => Err(if matches!(ec, ErrorCode::HttpRequestDenied) {
+    // Dispatch. A `handle()`-level Err means the request was rejected before
+    // a future was even produced — which is exactly how this host surfaces a
+    // gate denial. Map the denial code so it stays distinguishable.
+    let fut = match outgoing_handler::handle(req, None) {
+        Ok(f) => f,
+        Err(ec) => {
+            return Err(if matches!(ec, ErrorCode::HttpRequestDenied) {
                 2
             } else {
-                3
-            }),
-            _ => Err(4),
+                1
+            })
         }
+    };
+
+    // Block the (sync) guest until the response future is ready; Wasmtime
+    // drives the host's async send underneath.
+    let pollable = fut.subscribe();
+    pollable.block();
+
+    match fut.get() {
+        Some(Ok(Ok(resp))) => Ok(on_response(resp)),
+        Some(Ok(Err(ec))) => Err(if matches!(ec, ErrorCode::HttpRequestDenied) {
+            2
+        } else {
+            3
+        }),
+        _ => Err(4),
+    }
+}
+
+impl Guest for Component {
+    fn run(authority: String, use_https: bool) -> Result<u16, u8> {
+        send(&authority, use_https, Fields::new(), |resp| resp.status())
+    }
+
+    fn run_with_headers(
+        authority: String,
+        headers: Vec<(String, String)>,
+    ) -> Result<(u16, Vec<String>), u8> {
+        let fields = Fields::new();
+        for (name, value) in headers {
+            // A name the host forbids is refused here; skip it (the host-side
+            // test checks it never reaches the sender either way).
+            let _ = fields.append(&name, &value.into_bytes());
+        }
+        send(&authority, true, fields, |resp| {
+            let names = resp
+                .headers()
+                .entries()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            (resp.status(), names)
+        })
     }
 }
 
