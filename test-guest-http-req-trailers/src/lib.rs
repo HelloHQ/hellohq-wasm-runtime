@@ -11,8 +11,8 @@
 //!
 //! Unlike the no-trailers guests (which pass a ready `Ok(None)` trailers
 //! future), this guest's trailers future yields `Ok(Some(..))` — proving the
-//! host drains it and surfaces it OUT on the head as a reserved
-//! `x-hellohq-request-trailers` line.
+//! host drains it and surfaces it OUT as a final TRAILERS frame (see the
+//! runtime's `src/wasi_http_frames.rs`).
 
 wit_bindgen::generate!({
     path: "../wit-wasi",

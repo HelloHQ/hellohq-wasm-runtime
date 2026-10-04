@@ -105,11 +105,55 @@ fn pulley_http_handle_echo() {
 // the caller/servicer, draining it), we push a framed response back IN, and the
 // guest's returned bytes reflect that response (status 200 + body).
 
+use hellohq_wasm_runtime::wasi_http_frames::{
+    parse_request_frames, RequestFrames, KIND_BODY, KIND_HEAD, KIND_TRAILERS,
+};
 use hellohq_wasm_runtime::{
     hwr_p3s_free, hwr_p3s_out_len, hwr_p3s_out_ptr, hwr_p3s_poll, hwr_p3s_push, hwr_p3s_push_end,
-    hwr_p3s_result_len, hwr_p3s_result_ptr, hwr_p3s_start_http, HWR_P3S_DONE, HWR_P3S_OUT,
-    HWR_P3S_OUT_END,
+    hwr_p3s_result_len, hwr_p3s_result_ptr, hwr_p3s_start_http, HwrP3Stream, HWR_P3S_DONE,
+    HWR_P3S_OUT, HWR_P3S_OUT_END,
 };
+
+/// Drain the session's OUT frames up to OUT_END, keeping each frame separate
+/// (frame boundaries are part of the wire format — see `wasi_http_frames`).
+///
+/// # Safety
+/// `session` must be a live http session.
+unsafe fn drain_out_frames(session: *mut HwrP3Stream, use_pulley: bool) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    loop {
+        match hwr_p3s_poll(session) {
+            HWR_P3S_OUT => {
+                let ptr = hwr_p3s_out_ptr(session);
+                let len = hwr_p3s_out_len(session);
+                frames.push(std::slice::from_raw_parts(ptr, len).to_vec());
+            }
+            HWR_P3S_OUT_END => return frames,
+            other => {
+                panic!("unexpected status while draining: {other} (use_pulley={use_pulley})")
+            }
+        }
+    }
+}
+
+/// Parse drained frames with the reference parser, after checking every frame
+/// carries a known kind byte in the `HEAD BODY* TRAILERS?` order.
+fn parse_frames(frames: &[Vec<u8>], use_pulley: bool) -> RequestFrames {
+    assert_eq!(
+        frames.first().map(|f| f[0]),
+        Some(KIND_HEAD),
+        "first OUT frame must be the HEAD (use_pulley={use_pulley})"
+    );
+    for f in &frames[1..] {
+        assert!(
+            f[0] == KIND_BODY || f[0] == KIND_TRAILERS,
+            "unexpected kind byte {:#04x} (use_pulley={use_pulley})",
+            f[0]
+        );
+    }
+    parse_request_frames(frames.iter().map(Vec::as_slice))
+        .unwrap_or_else(|e| panic!("malformed OUT frames {e:?} (use_pulley={use_pulley})"))
+}
 
 /// Drive the full transport round-trip: start the http session over the P3 v2
 /// transport, act as the servicer (drain the request, push a 200 response), and
@@ -119,29 +163,23 @@ fn run_via_transport(use_pulley: bool) -> Vec<u8> {
         let session = hwr_p3s_start_http(use_pulley as i32, GUEST_WASM.as_ptr(), GUEST_WASM.len());
         assert!(!session.is_null(), "start failed (use_pulley={use_pulley})");
 
-        // (1) Drain the outbound request frames until OUT_END; the head must name
-        //     the GET request the guest built.
-        let mut req_head = Vec::new();
-        loop {
-            match hwr_p3s_poll(session) {
-                HWR_P3S_OUT => {
-                    let ptr = hwr_p3s_out_ptr(session);
-                    let len = hwr_p3s_out_len(session);
-                    req_head.extend_from_slice(std::slice::from_raw_parts(ptr, len));
-                }
-                HWR_P3S_OUT_END => break,
-                other => {
-                    panic!("unexpected status while draining: {other} (use_pulley={use_pulley})")
-                }
-            }
-        }
-        let head_str = String::from_utf8_lossy(&req_head);
+        // (1) Drain the outbound request frames until OUT_END: a lone HEAD
+        //     naming the GET request the guest built (no body, no trailers).
+        let frames = drain_out_frames(session, use_pulley);
+        assert_eq!(
+            frames.len(),
+            1,
+            "GET emits only a HEAD (use_pulley={use_pulley})"
+        );
+        let req = parse_frames(&frames, use_pulley);
+        let head_str = String::from_utf8_lossy(&req.head);
         // Wire framing: "{METHOD} {scheme}://{authority}{path}" → here
         // "GET https://example.com/". Half B must match this exact shape.
         assert!(
             head_str.starts_with("GET ") && head_str.contains("example.com/"),
             "request head missing GET line: {head_str:?} (use_pulley={use_pulley})"
         );
+        assert!(req.body.is_empty() && req.trailers.is_none());
 
         // (2) Push the framed response back IN: head ("{status}\n{header}") then
         //     MULTIPLE body chunks (proving the host streams them through to the
@@ -212,8 +250,8 @@ fn pulley_http_handle_via_transport() {
 
 /// Drive the POST round-trip: start the session with the POST guest, drain the
 /// outbound frames (head + request body), push a 200 response, return the
-/// guest's run result and the concatenated outbound bytes.
-fn run_post_via_transport(use_pulley: bool) -> (Vec<u8>, Vec<u8>) {
+/// guest's run result and the outbound frames.
+fn run_post_via_transport(use_pulley: bool) -> (Vec<u8>, Vec<Vec<u8>>) {
     unsafe {
         let session = hwr_p3s_start_http(
             use_pulley as i32,
@@ -222,23 +260,9 @@ fn run_post_via_transport(use_pulley: bool) -> (Vec<u8>, Vec<u8>) {
         );
         assert!(!session.is_null(), "start failed (use_pulley={use_pulley})");
 
-        // (1) Drain ALL outbound frames (head + streamed request body) to
-        //     OUT_END. We concatenate them so we can assert both the head line
-        //     and the body bytes appear.
-        let mut outbound = Vec::new();
-        loop {
-            match hwr_p3s_poll(session) {
-                HWR_P3S_OUT => {
-                    let ptr = hwr_p3s_out_ptr(session);
-                    let len = hwr_p3s_out_len(session);
-                    outbound.extend_from_slice(std::slice::from_raw_parts(ptr, len));
-                }
-                HWR_P3S_OUT_END => break,
-                other => {
-                    panic!("unexpected status while draining: {other} (use_pulley={use_pulley})")
-                }
-            }
-        }
+        // (1) Drain ALL outbound frames (HEAD + streamed BODY frames) to
+        //     OUT_END.
+        let outbound = drain_out_frames(session, use_pulley);
 
         // (2) Push a framed 200 response, then close inbound.
         let resp_head = b"200\nx-test: yes";
@@ -264,18 +288,25 @@ fn run_post_via_transport(use_pulley: bool) -> (Vec<u8>, Vec<u8>) {
 fn assert_post_transport(use_pulley: bool) {
     let (out, outbound) = run_post_via_transport(use_pulley);
 
-    // The outbound frames must carry the POST head AND the streamed request body
-    // bytes — proving the request body reached the servicer via streaming.
-    let outbound_str = String::from_utf8_lossy(&outbound);
+    // The outbound frames must carry the POST HEAD and, in BODY frames, exactly
+    // the streamed request body bytes — proving the request body reached the
+    // servicer via streaming, separate from the head.
+    let req = parse_frames(&outbound, use_pulley);
+    let head_str = String::from_utf8_lossy(&req.head);
     assert!(
-        outbound_str.starts_with("POST ") && outbound_str.contains("example.com/submit"),
-        "outbound missing POST head: {outbound_str:?} (use_pulley={use_pulley})"
+        head_str.starts_with("POST ") && head_str.contains("example.com/submit"),
+        "outbound missing POST head: {head_str:?} (use_pulley={use_pulley})"
     );
     assert!(
-        outbound_str.contains("req-body-123"),
-        "outbound missing streamed request body bytes: {outbound_str:?} \
-         (use_pulley={use_pulley})"
+        !head_str.contains("req-body-123"),
+        "body leaked into the head: {head_str:?} (use_pulley={use_pulley})"
     );
+    assert_eq!(
+        String::from_utf8_lossy(&req.body),
+        "req-body-123",
+        "BODY frames must carry exactly the request body (use_pulley={use_pulley})"
+    );
+    assert_eq!(req.trailers, None, "(use_pulley={use_pulley})");
 
     // The guest received the servicer's 200 response.
     assert!(
@@ -302,10 +333,10 @@ fn pulley_http_handle_post_request_body() {
 //
 // The req-trailers guest builds a GET request whose request trailers future
 // resolves to `Ok(Some(fields))` carrying `x-trace` = "req-trailer-1". The host
-// drains that future and emits the trailers OUT on the head as a reserved
-// `x-hellohq-request-trailers: x-trace=<hex>` line (values hex-encoded). We
-// drain ALL outbound frames and assert that line appears with the hex of
-// "req-trailer-1", then push a 200 response and assert the guest received it.
+// drains that future and emits the trailers OUT as a final TRAILERS frame,
+// `x-trace=<hex>` (values hex-encoded). We drain ALL outbound frames and assert
+// that frame carries the hex of "req-trailer-1", then push a 200 response and
+// assert the guest received it.
 
 /// Lowercase-hex encode (matches the host's `hex_encode`) so the test computes
 /// the expected `x-trace=<hex>` value independently.
@@ -318,9 +349,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Drive the request-trailers round-trip: start the session with the trailers
-/// guest, drain the outbound frames (head + trailers line), push a 200 response,
-/// return the guest's run result and the concatenated outbound bytes.
-fn run_req_trailers_via_transport(use_pulley: bool) -> (Vec<u8>, Vec<u8>) {
+/// guest, drain the outbound frames (HEAD + TRAILERS), push a 200 response,
+/// return the guest's run result and the outbound frames.
+fn run_req_trailers_via_transport(use_pulley: bool) -> (Vec<u8>, Vec<Vec<u8>>) {
     unsafe {
         let session = hwr_p3s_start_http(
             use_pulley as i32,
@@ -329,22 +360,8 @@ fn run_req_trailers_via_transport(use_pulley: bool) -> (Vec<u8>, Vec<u8>) {
         );
         assert!(!session.is_null(), "start failed (use_pulley={use_pulley})");
 
-        // (1) Drain ALL outbound frames (head + request-trailers line) to
-        //     OUT_END, concatenating them.
-        let mut outbound = Vec::new();
-        loop {
-            match hwr_p3s_poll(session) {
-                HWR_P3S_OUT => {
-                    let ptr = hwr_p3s_out_ptr(session);
-                    let len = hwr_p3s_out_len(session);
-                    outbound.extend_from_slice(std::slice::from_raw_parts(ptr, len));
-                }
-                HWR_P3S_OUT_END => break,
-                other => {
-                    panic!("unexpected status while draining: {other} (use_pulley={use_pulley})")
-                }
-            }
-        }
+        // (1) Drain ALL outbound frames (HEAD + TRAILERS) to OUT_END.
+        let outbound = drain_out_frames(session, use_pulley);
 
         // (2) Push a framed 200 response, then close inbound.
         let resp_head = b"200\nx-test: yes";
@@ -368,18 +385,28 @@ fn run_req_trailers_via_transport(use_pulley: bool) -> (Vec<u8>, Vec<u8>) {
 fn assert_req_trailers_transport(use_pulley: bool) {
     let (out, outbound) = run_req_trailers_via_transport(use_pulley);
 
-    // The outbound frames must carry the reserved request-trailers head line
-    // with the hex of "req-trailer-1" — proving the guest's request trailers
-    // future was drained and surfaced OUT.
-    let outbound_str = String::from_utf8_lossy(&outbound);
-    let expected = format!(
-        "x-hellohq-request-trailers: x-trace={}",
-        hex_encode(b"req-trailer-1")
+    // The last outbound frame must be a TRAILERS frame carrying the hex of
+    // "req-trailer-1" — proving the guest's request trailers future was
+    // drained and surfaced OUT — and nothing trailer-like is left in the head.
+    assert_eq!(
+        outbound.last().map(|f| f[0]),
+        Some(KIND_TRAILERS),
+        "last OUT frame must be TRAILERS (use_pulley={use_pulley})"
     );
+    let req = parse_frames(&outbound, use_pulley);
+    let expected = format!("x-trace={}", hex_encode(b"req-trailer-1"));
+    assert_eq!(
+        req.trailers
+            .as_deref()
+            .map(String::from_utf8_lossy)
+            .as_deref(),
+        Some(expected.as_str()),
+        "(use_pulley={use_pulley})"
+    );
+    assert!(req.body.is_empty(), "(use_pulley={use_pulley})");
     assert!(
-        outbound_str.contains(&expected),
-        "outbound missing request-trailers line {expected:?}: {outbound_str:?} \
-         (use_pulley={use_pulley})"
+        !String::from_utf8_lossy(&req.head).contains("x-trace"),
+        "trailers leaked into the head (use_pulley={use_pulley})"
     );
 
     // The guest received the servicer's 200 response (status prefix only).

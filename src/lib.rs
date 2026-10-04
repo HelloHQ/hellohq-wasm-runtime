@@ -37,8 +37,6 @@
 //! Safety: every `extern "C"` entrypoint must `catch_unwind` and never let a
 //! panic cross the FFI boundary (see `Cargo.toml` `panic = unwind`).
 
-/// C ABI version. Bumped on any breaking change to the exported surface so the
-/// Dart `dart:ffi` loader can refuse a mismatched native library.
 // STAGE 1 scaffolding: the host state + trait impls are exercised by the
 // module's own unit tests and consumed by later stages (the C ABI wiring lands
 // when streaming does). Until then the non-test build sees them as unused.
@@ -48,6 +46,13 @@
 #[cfg(feature = "wasi-http")]
 #[allow(dead_code)]
 pub mod wasi_http;
+
+// The kind-tagged OUT-frame format `wasi_http`'s transport path emits (HEAD,
+// BODY, TRAILERS) plus its reference parser — the wire contract with the app's
+// `parseHttpRequestFrames`. `pub` so the integration tests parse real sessions
+// with the same code.
+#[cfg(feature = "wasi-http")]
+pub mod wasi_http_frames;
 
 // The hand-built `hellohq:plugin/inference` streaming host — the async-first AI
 // inference capability this crate exists for. STRUCTURALLY IDENTICAL to
@@ -132,7 +137,15 @@ pub mod plugin_host_storage_events;
 #[cfg(feature = "typed-hosts")]
 pub mod plugin_host_full;
 
-pub const HWR_ABI_VERSION: u32 = 1;
+/// C ABI version. Bumped on any breaking change to the exported surface —
+/// symbols, signatures, or the byte format a symbol produces — so the Dart
+/// `dart:ffi` loader can refuse a mismatched native library.
+///
+/// * 1 — initial surface.
+/// * 2 — `hwr_p3s_start_http*` OUT frames are kind-tagged (HEAD / BODY /
+///   TRAILERS, see `src/wasi_http_frames.rs`); request trailers moved from a
+///   `x-hellohq-request-trailers:` text frame into a TRAILERS frame.
+pub const HWR_ABI_VERSION: u32 = 2;
 
 // In-process Wasm compilation/execution requires Cranelift and is available only
 // in `compile` builds (desktop/Android/CI). iOS (no-JIT) builds omit Cranelift
@@ -1701,7 +1714,8 @@ fn p3s_inference_session(
 }
 
 /// STAGE 4: start a streaming `wasi:http` session by COMPILING `component`
-/// (Cranelift). The guest's `handler.handle` frames the request OUT (drained via
+/// (Cranelift). The guest's `handler.handle` frames the request OUT as
+/// kind-tagged HEAD / BODY / TRAILERS frames (`src/wasi_http_frames.rs`; drained via
 /// [hwr_p3s_poll]/[hwr_p3s_out_ptr]) and builds the response from pushed-IN
 /// frames ([hwr_p3s_push]/[hwr_p3s_push_end]); the run result is the guest's
 /// `list<u8>` (status prefix + body).
@@ -1738,7 +1752,8 @@ pub unsafe extern "C" fn hwr_p3s_start_http(
 
 /// No-JIT twin of [hwr_p3s_start_http]: DESERIALIZE a precompiled (pulley64)
 /// component artifact instead of compiling it, so the streaming `wasi:http` path
-/// runs on the iOS Pulley build (no Cranelift). Gated on `wasi-http` only.
+/// runs on the iOS Pulley build (no Cranelift). Same OUT-frame format
+/// (`src/wasi_http_frames.rs`). Gated on `wasi-http` only.
 ///
 /// # Safety
 /// `component` must point to `component_len` readable bytes that are a trusted

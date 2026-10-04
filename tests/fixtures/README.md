@@ -196,8 +196,8 @@ servicing `handle` — `wit_bindgen::spawn_local`s a task that writes the real
 value `Ok(Some(fields))` (a `Fields` carrying `x-trace` = "req-trailer-1") to the
 writer half, concurrently with `handle().await` (mirroring how the POST guest
 writes its request body). The host drains that future host-side (via a
-`FutureConsumer`) and surfaces the trailers OUT on the head as a reserved
-`x-hellohq-request-trailers: x-trace=<hex>` line (values hex-encoded) — so the
+`FutureConsumer`) and surfaces the trailers OUT as a final TRAILERS frame
+(`x-trace=<hex>`, values hex-encoded; see `src/wasi_http_frames.rs`) — so the
 host test can assert the request trailers reached the servicer. `run` returns the
 response status bytes.
 
@@ -267,7 +267,14 @@ wasm-tools component wit tests/fixtures/http02_guest.component.wasm
 # import wasi:http/types@0.2.10;
 # import wasi:http/outgoing-handler@0.2.10;
 # export run: func(authority: string, use-https: bool) -> result<u16, u8>;
+# export run-with-headers: func(authority: string, headers: list<tuple<string, string>>) -> result<tuple<u16, list<string>>, u8>;
 ```
+
+`run-with-headers` is the plugin request-policy proof: it sets the given request
+headers (skipping any the host forbids), sends an https GET, and returns the
+status plus the response header names the guest can see. The host test checks
+that only allowlisted headers reach the sender, that `Set-Cookie` never reaches
+the guest, and that the reserved `x-hellohq-credential` header is refused.
 
 ### Regenerate
 

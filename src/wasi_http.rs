@@ -25,6 +25,8 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::wasi_http_frames::{self as frames, OutFrameKind};
+
 wasmtime::component::bindgen!({
     path: "wit-wasi",
     world: "http-probe",
@@ -1044,25 +1046,22 @@ async fn handle_via_transport<T: Send>(
             .map(|f| f.entries.clone())
             .unwrap_or_default();
 
-        // Frame 1 = head: "{METHOD} {scheme}://{authority}{path}" then one
-        // "{name}: {value}" line per header, '\n'-separated.
-        let mut head = format!("{method} {scheme}://{authority}{path}");
-        for (name, value) in &header_entries {
-            head.push('\n');
-            head.push_str(name);
-            head.push_str(": ");
-            head.push_str(&String::from_utf8_lossy(value));
-        }
         // Surface the request's `request-options` timeouts to the caller (which
         // enforces them; the host has no timer) as a reserved head line.
         let options_line = req
             .options
             .and_then(|rep| host.options.get(rep))
             .and_then(format_request_options_line);
-        if let Some(line) = options_line {
-            head.push('\n');
-            head.push_str(&line);
-        }
+
+        // Frame 1 = HEAD (see `crate::wasi_http_frames`).
+        let head = encode_request_head(
+            &method,
+            &scheme,
+            &authority,
+            &path,
+            &header_entries,
+            options_line.as_deref(),
+        )?;
 
         // Take the stashed request-body stream out (so we can stream it OUT) and
         // the inbound receiver out (so we can await it without the borrow).
@@ -1077,12 +1076,14 @@ async fn handle_via_transport<T: Send>(
                 "wasi:http handler: transport missing".to_string(),
             )));
         };
-        transport.out.chunk(head.into_bytes());
+        transport
+            .out
+            .chunk(frames::encode(OutFrameKind::Head, &head));
         let inbound = transport.inbound.take();
         Ok((inbound, req_body, req_trailers))
     })?;
 
-    // (1b) If the request carries a body, stream it OUT frame-by-frame before
+    // (1b) If the request carries a body, stream it OUT as BODY frames before
     //      ending the outbound stream. We read the guest's `stream<u8>`
     //      host-side via a `StreamConsumer` ([`RequestBodyConsumer`]) piped onto
     //      the body reader: it forwards each consumed batch through an mpsc
@@ -1107,7 +1108,9 @@ async fn handle_via_transport<T: Send>(
             accessor.with(|mut access| {
                 let host = access.get();
                 if let Some(transport) = host.transport.as_mut() {
-                    transport.out.chunk(chunk);
+                    transport
+                        .out
+                        .chunk(frames::encode(OutFrameKind::Body, &chunk));
                 }
             });
         }
@@ -1115,9 +1118,9 @@ async fn handle_via_transport<T: Send>(
 
     // (1c) Drain the guest's REQUEST trailers future (stashed in `request::new`)
     //      and, if it yields `Ok(Some(fields))`, surface its entries OUT as a
-    //      final reserved head line ([`REQUEST_TRAILERS_HEAD_KEY`]) BEFORE we
-    //      end the outbound stream — so the caller (and upstream) can see the
-    //      request trailers. We read the single-value future host-side via a
+    //      final TRAILERS frame BEFORE we end the outbound stream — so the
+    //      caller (and upstream) can see the request trailers. We read the
+    //      single-value future host-side via a
     //      `FutureConsumer` ([`RequestTrailersConsumer`]) piped onto it, send the
     //      item through a oneshot, and await it OUTSIDE `with` (mirrors the body
     //      drain's borrow discipline). `Ok(None)` / `Err(_)` / channel errors
@@ -1142,26 +1145,28 @@ async fn handle_via_transport<T: Send>(
         // guest). `Ok(None)` / `Err(_)` / channel error also emit nothing.
         let resolved = await_trailers_bounded(rx).await;
         if let Some(Ok(Ok(Some(fields_rep)))) = resolved {
-            // Look up the trailer fields' entries inside a fresh `with`, format
-            // the reserved line, and emit it as a final OUT frame.
-            let line = accessor.with(|mut access| {
+            // Look up the trailer fields' entries inside a fresh `with`, encode
+            // them, and emit them as the final (TRAILERS) OUT frame.
+            let value = accessor.with(|mut access| {
                 let host = access.get();
                 host.fields
                     .get(fields_rep.rep())
-                    .and_then(|f| format_request_trailers_line(&f.entries))
+                    .and_then(|f| format_request_trailers_value(&f.entries))
             });
-            if let Some(line) = line {
+            if let Some(value) = value {
                 accessor.with(|mut access| {
                     let host = access.get();
                     if let Some(transport) = host.transport.as_mut() {
-                        transport.out.chunk(line.into_bytes());
+                        transport
+                            .out
+                            .chunk(frames::encode(OutFrameKind::Trailers, value.as_bytes()));
                     }
                 });
             }
         }
     }
 
-    // End the outbound stream: head (+ any body frames + trailers line) emitted.
+    // End the outbound stream: HEAD (+ any BODY frames + TRAILERS) emitted.
     accessor.with(|mut access| {
         let host = access.get();
         if let Some(transport) = host.transport.as_mut() {
@@ -1475,13 +1480,13 @@ fn method_str(m: &MethodOwned) -> &str {
     }
 }
 
-// ─── Transport head-frame extensions: request options + response trailers ────
+// ─── Transport framing: the request head, options and trailers ──────────────
 //
-// The P3 transport frames a request OUT (head + body) to the gated caller
-// (Dart's fetch) and frames the response back IN (head + body). The head is a
+// The P3 transport frames a request OUT to the gated caller (Dart's fetch) as
+// kind-tagged frames — HEAD, BODY*, TRAILERS? (`crate::wasi_http_frames`) — and
+// the caller frames the response back IN (head + body). Each head is a
 // `\n`-separated set of `name: value` lines. Two `wasi:http@0.3-rc` features
-// ride that head as reserved lines, so no new frame type / Dart-side signal is
-// needed and a caller that ignores them degrades to the prior behaviour:
+// ride those heads as reserved lines:
 //
 //   * REQUEST OPTIONS (OUT head): the request's `request-options` timeouts are
 //     SURFACED to the caller, which OWNS enforcement — the in-process executor
@@ -1489,6 +1494,96 @@ fn method_str(m: &MethodOwned) -> &str {
 //   * RESPONSE TRAILERS (IN head): the caller reports the upstream response's
 //     trailers, which the host resolves the response trailers future with
 //     (instead of the prior hard-coded `Ok(None)`).
+//
+// The guest's REQUEST trailers travel in their own TRAILERS frame (formerly a
+// reserved `x-hellohq-request-trailers:` line in a trailing frame, which a
+// body chunk starting with that text could be mistaken for).
+
+/// True for an RFC 9110 `token` (a method or field name): non-empty and only
+/// `tchar`s. Anything else could break the line-based head.
+fn is_http_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// True when `s` can sit in the head's request line: no whitespace (the space
+/// is the separator, a newline would end the line) and no control character.
+/// Authority and path are guest-set and this host does not otherwise validate
+/// them; anything else (e.g. non-ASCII) is left for the caller's URL parser.
+fn is_request_line_safe(s: &str) -> bool {
+    s.chars().all(|c| !c.is_whitespace() && !c.is_control())
+}
+
+/// Build the HEAD frame payload: `"{METHOD} {scheme}://{authority}{path}"`, a
+/// `"{name}: {value}"` line per header, then `options_line` if any.
+///
+/// The guest sets method, authority, path and headers, and this host does not
+/// validate them when they are set, so they are checked here to keep the head
+/// unambiguous:
+///   * a method that is not a token → `HttpRequestMethodInvalid`;
+///   * a scheme, authority or path with a space or control character →
+///     `HttpRequestUriInvalid`;
+///   * a header whose name is not a token, whose value contains CR, LF or NUL,
+///     or whose name is the runtime-reserved [`REQUEST_OPTIONS_HEAD_KEY`] is
+///     left out (the caller's header allowlist would drop it anyway).
+///
+/// Header values are otherwise passed through (lossy UTF-8); the caller applies
+/// its header policy to what arrives.
+fn encode_request_head(
+    method: &str,
+    scheme: &str,
+    authority: &str,
+    path: &str,
+    headers: &[(String, FieldValue)],
+    options_line: Option<&str>,
+) -> Result<Vec<u8>, ErrorCode> {
+    if !is_http_token(method) {
+        return Err(ErrorCode::HttpRequestMethodInvalid);
+    }
+    if !is_request_line_safe(scheme)
+        || !is_request_line_safe(authority)
+        || !is_request_line_safe(path)
+    {
+        return Err(ErrorCode::HttpRequestUriInvalid);
+    }
+    let mut head = format!("{method} {scheme}://{authority}{path}");
+    for (name, value) in headers {
+        if !is_http_token(name)
+            || name.eq_ignore_ascii_case(REQUEST_OPTIONS_HEAD_KEY)
+            || value.iter().any(|b| matches!(b, b'\r' | b'\n' | 0))
+        {
+            continue;
+        }
+        head.push('\n');
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(&String::from_utf8_lossy(value));
+    }
+    if let Some(line) = options_line {
+        head.push('\n');
+        head.push_str(line);
+    }
+    Ok(head.into_bytes())
+}
 
 /// Reserved OUT head line carrying the request's timeouts (nanoseconds) for the
 /// caller to enforce: `x-hellohq-request-options: connect=<ns>;first-byte=<ns>;
@@ -1499,13 +1594,6 @@ const REQUEST_OPTIONS_HEAD_KEY: &str = "x-hellohq-request-options";
 /// `x-hellohq-trailers: <name>=<hex(value)>;...`. Values are hex-encoded so
 /// arbitrary bytes survive the `;`/`=`/`\n`-delimited head framing.
 const TRAILERS_HEAD_KEY: &str = "x-hellohq-trailers";
-
-/// Reserved OUT head line carrying the guest's REQUEST trailer fields (drained
-/// from the request's trailers future) so the caller (and upstream) can see
-/// them: `x-hellohq-request-trailers: <name>=<hex(value)>;...`. Distinct from
-/// the response [`TRAILERS_HEAD_KEY`] (which rides the IN head). Values are
-/// hex-encoded so arbitrary bytes survive the `;`/`=`/`\n` head framing.
-const REQUEST_TRAILERS_HEAD_KEY: &str = "x-hellohq-request-trailers";
 
 /// Format the [`REQUEST_OPTIONS_HEAD_KEY`] line for `opts`, or `None` if no
 /// timeout is set (so no line is emitted). `Duration` is `u64` nanoseconds.
@@ -1553,19 +1641,21 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Format the [`REQUEST_TRAILERS_HEAD_KEY`] line for `entries` (the guest's
-/// request trailer fields), or `None` if empty (so no line is emitted). Values
-/// are hex-encoded, mirroring [`parse_trailers_line`]'s decode so the Dart side
-/// hex-decodes them: `x-hellohq-request-trailers: <name>=<hex(value)>;...`.
-fn format_request_trailers_line(entries: &[(String, FieldValue)]) -> Option<String> {
-    if entries.is_empty() {
-        return None;
-    }
+/// Encode `entries` (the guest's request trailer fields) as the TRAILERS frame
+/// payload `<name>=<hex(value)>;...`, or `None` if there are none (so no frame
+/// is emitted). Values are hex-encoded, mirroring [`parse_trailers_line`]'s
+/// decode, so arbitrary bytes survive the `;`/`=` separators; an entry whose
+/// name is not a token (it could contain `=` or `;`) is left out.
+fn format_request_trailers_value(entries: &[(String, FieldValue)]) -> Option<String> {
     let parts: Vec<String> = entries
         .iter()
+        .filter(|(name, _)| is_http_token(name))
         .map(|(name, value)| format!("{name}={}", hex_encode(value)))
         .collect();
-    Some(format!("{REQUEST_TRAILERS_HEAD_KEY}: {}", parts.join(";")))
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join(";"))
 }
 
 /// Decode a lowercase/uppercase hex string to bytes; `None` on odd length or a
@@ -1959,21 +2049,16 @@ mod tests {
     }
 
     #[test]
-    fn request_trailers_line_omits_empty_and_emits_entries() {
-        // No entries → no line at all.
-        assert_eq!(format_request_trailers_line(&[]), None);
+    fn request_trailers_value_omits_empty_and_emits_entries() {
+        // No entries → no frame at all.
+        assert_eq!(format_request_trailers_value(&[]), None);
 
-        // A single entry hex-encodes its value; "req-trailer-1" → its hex.
+        // A single entry hex-encodes its value; "req-trailer-1" → its hex. No
+        // key prefix: the TRAILERS frame kind byte says what this is.
         let entries = vec![("x-trace".to_string(), b"req-trailer-1".to_vec())];
         assert_eq!(
-            format_request_trailers_line(&entries).as_deref(),
-            Some(
-                format!(
-                    "x-hellohq-request-trailers: x-trace={}",
-                    hex_encode(b"req-trailer-1")
-                )
-                .as_str()
-            )
+            format_request_trailers_value(&entries),
+            Some(format!("x-trace={}", hex_encode(b"req-trailer-1")))
         );
 
         // Multiple entries are ';'-joined, and decode back via parse_trailers_line
@@ -1982,8 +2067,125 @@ mod tests {
             ("x-checksum".to_string(), b"a;b=c".to_vec()),
             ("trace".to_string(), b"1".to_vec()),
         ];
-        let line = format_request_trailers_line(&entries).unwrap();
-        let value = line.strip_prefix("x-hellohq-request-trailers: ").unwrap();
-        assert_eq!(parse_trailers_line(value), entries);
+        let value = format_request_trailers_value(&entries).unwrap();
+        assert_eq!(parse_trailers_line(&value), entries);
+
+        // A name that could break the `;`/`=` encoding is left out; if that
+        // leaves nothing, no frame.
+        let entries = vec![
+            ("bad=name".to_string(), b"1".to_vec()),
+            ("ok".to_string(), b"2".to_vec()),
+        ];
+        assert_eq!(
+            format_request_trailers_value(&entries).as_deref(),
+            Some("ok=32")
+        );
+        assert_eq!(
+            format_request_trailers_value(&[("a;b".to_string(), b"1".to_vec())]),
+            None
+        );
+    }
+
+    fn head_text(head: Result<Vec<u8>, ErrorCode>) -> String {
+        String::from_utf8(head.expect("head must encode")).unwrap()
+    }
+
+    #[test]
+    fn request_head_is_request_line_then_headers_then_options() {
+        let headers = vec![
+            ("accept".to_string(), b"application/json".to_vec()),
+            ("x-hellohq-credential".to_string(), b"handle-1".to_vec()),
+        ];
+        assert_eq!(
+            head_text(encode_request_head(
+                "POST",
+                "https",
+                "api.example.com",
+                "/v1?q=1",
+                &headers,
+                Some("x-hellohq-request-options: connect=1"),
+            )),
+            "POST https://api.example.com/v1?q=1\n\
+             accept: application/json\n\
+             x-hellohq-credential: handle-1\n\
+             x-hellohq-request-options: connect=1"
+        );
+        // No headers, no options → just the request line.
+        assert_eq!(
+            head_text(encode_request_head(
+                "GET",
+                "https",
+                "a.example",
+                "/",
+                &[],
+                None
+            )),
+            "GET https://a.example/"
+        );
+    }
+
+    /// Guest-set values that would add, split or spoof a head line are left
+    /// out (headers) or refused (method / URI parts).
+    #[test]
+    fn request_head_cannot_be_split_or_spoofed() {
+        let headers = vec![
+            ("accept".to_string(), b"a\nx-injected: 1".to_vec()),
+            ("x-cr".to_string(), b"a\rb".to_vec()),
+            ("x-nul".to_string(), b"a\0b".to_vec()),
+            ("bad name".to_string(), b"1".to_vec()),
+            ("bad:name".to_string(), b"1".to_vec()),
+            ("".to_string(), b"1".to_vec()),
+            (
+                "X-HelloHQ-Request-Options".to_string(),
+                b"connect=1".to_vec(),
+            ),
+            (
+                "content-type".to_string(),
+                b"text/plain; charset=utf-8".to_vec(),
+            ),
+        ];
+        assert_eq!(
+            head_text(encode_request_head(
+                "GET",
+                "https",
+                "a.example",
+                "/",
+                &headers,
+                None
+            )),
+            "GET https://a.example/\ncontent-type: text/plain; charset=utf-8"
+        );
+
+        for method in ["GET X", "", "GET\n"] {
+            assert!(
+                matches!(
+                    encode_request_head(method, "https", "a.example", "/", &[], None),
+                    Err(ErrorCode::HttpRequestMethodInvalid)
+                ),
+                "{method:?}"
+            );
+        }
+        for (scheme, authority, path) in [
+            ("https", "a.example", "/x\nx-injected: 1"),
+            ("https", "a.example", "/x y"),
+            ("https", "a.example\r", "/"),
+            ("ht tps", "a.example", "/"),
+        ] {
+            assert!(
+                matches!(
+                    encode_request_head("GET", scheme, authority, path, &[], None),
+                    Err(ErrorCode::HttpRequestUriInvalid)
+                ),
+                "{scheme:?} {authority:?} {path:?}"
+            );
+        }
+        // A custom (token) method is fine, and so is a non-ASCII path (the
+        // caller's URL parser decides about that).
+        assert!(encode_request_head("PROPFIND", "https", "a.example", "/", &[], None).is_ok());
+        assert!(encode_request_head("GET", "https", "a.example", "/café", &[], None).is_ok());
+        assert!(matches!(
+            encode_request_head("GET", "https", "a.example", "/a\u{7f}b", &[], None),
+            Err(ErrorCode::HttpRequestUriInvalid)
+        ));
     }
 }
