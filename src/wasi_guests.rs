@@ -23,7 +23,10 @@
 //! instantiation fails on the missing import). Outbound is **gated**: a
 //! [`GatedHttpHooks`] runs the [`crate::fetch_gate`] (origin allowlist + H4/H5
 //! SSRF / private-IP block + https-only) before any real request leaves the
-//! host; an empty allowlist denies everything (the safe default).
+//! host; an empty allowlist denies everything (the safe default). It then
+//! applies the app's plugin request policy ([`crate::request_policy`]): request
+//! headers cut to the allowlist, `Set-Cookie` stripped from responses, no
+//! redirects, and no free-form (URL-bearing) text in errors handed to the guest.
 //!
 //! ## "Support all WASI generations at once"
 //! One [`wasmtime::component::Linker`] over [`GoGuestState`] registers, without
@@ -59,12 +62,15 @@
 
 use crate::capstone::CapstoneHarness;
 use crate::fetch_gate::{self, FetchDenial};
+use crate::request_policy;
 use wasmtime::component::{Linker, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
-use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
-use wasmtime_wasi_http::p2::{HttpResult, WasiHttpCtxView, WasiHttpView};
+use wasmtime_wasi_http::p2::types::{
+    HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig,
+};
+use wasmtime_wasi_http::p2::{HttpError, HttpResult, WasiHttpCtxView, WasiHttpView};
 use wasmtime_wasi_http::WasiHttpCtx;
 
 /// The actual-send step `GatedHttpHooks` calls AFTER the gate passes. Injectable
@@ -84,7 +90,9 @@ pub type SendFn = Box<
 /// does NOT follow redirects — `default_send_request_handler` does a single
 /// hyper send over one connection, so a 3xx is surfaced to the guest as-is.
 /// That is exactly the `followRedirects = false` (H4) behavior the Dart gate
-/// enforces; there is no auto-redirect to disable on this version.
+/// enforces; there is no auto-redirect to disable on this version. The test
+/// `production_sender_does_not_follow_redirects` pins this against a real
+/// loopback server, so a wasmtime bump that starts following redirects fails CI.
 fn default_sender(
     request: hyper::Request<HyperOutgoingBody>,
     config: OutgoingRequestConfig,
@@ -108,15 +116,51 @@ pub fn canned_status_sender(
     status: u16,
     reached: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> SendFn {
+    use std::sync::atomic::Ordering;
+    let mut respond = canned_response_sender(status, Vec::new(), Default::default());
+    Box::new(move |req, cfg| {
+        reached.store(true, Ordering::SeqCst);
+        respond(req, cfg)
+    })
+}
+
+/// Request headers a [`canned_response_sender`] received, as `(name, value)`
+/// pairs (lower-case names, grouped by name) — `None` until the sender is
+/// reached.
+#[doc(hidden)]
+pub type SeenHeaders = std::sync::Arc<std::sync::Mutex<Option<Vec<(String, String)>>>>;
+
+/// Test / embedder **stub** sender: performs NO network I/O. Records the
+/// request headers it was handed (after the policy ran) into `seen`, and
+/// returns a ready response with `status`, the given `response_headers` and an
+/// empty body. Lets a test check, from a real guest, both what reaches the wire
+/// and what the guest sees of a response (e.g. that `Set-Cookie` is stripped).
+#[doc(hidden)]
+pub fn canned_response_sender(
+    status: u16,
+    response_headers: Vec<(String, String)>,
+    seen: SeenHeaders,
+) -> SendFn {
     use bytes::Bytes;
     use http_body_util::{BodyExt, Empty};
-    use std::sync::atomic::Ordering;
-    use wasmtime_wasi_http::p2::types::IncomingResponse;
 
-    Box::new(move |_req, cfg| {
-        reached.store(true, Ordering::SeqCst);
-        let resp = hyper::Response::builder()
-            .status(status)
+    Box::new(move |req, cfg| {
+        let headers = req
+            .headers()
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.as_str().to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        *seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(headers);
+        let mut builder = hyper::Response::builder().status(status);
+        for (name, value) in &response_headers {
+            builder = builder.header(name, value);
+        }
+        let resp = builder
             .body(
                 Empty::<Bytes>::new()
                     .map_err(|_| unreachable!())
@@ -138,8 +182,20 @@ pub fn canned_status_sender(
 ///   2. runs [`fetch_gate::check_request`] against the per-plugin
 ///      `allowlist` — on denial returns the mapped [`ErrorCode`]
 ///      (`HttpRequestDenied`) WITHOUT touching the network,
-///   3. on a pass, delegates to the injectable `send` (default: the turnkey
-///      hyper sender) to perform the real request.
+///   3. refuses (`HttpRequestDenied`) a request carrying the reserved
+///      credential-handle header (doc 30 §4.6 — this path never carries
+///      credentials),
+///   4. drops every request header the plugin may not set
+///      ([`request_policy::is_allowed_request_header`] — the same allowlist the
+///      app's `PluginRequestPolicy` applies on every other path),
+///   5. delegates to the injectable `send` (default: the turnkey hyper sender,
+///      which does not follow redirects) to perform the real request,
+///   6. strips `Set-Cookie`/`Set-Cookie2` from the response and blanks the
+///      free-form text in any error before the guest sees it.
+///
+/// `Set-Cookie` is ALSO declared a forbidden header ([`Self::is_forbidden_header`]),
+/// which `wasmtime-wasi-http` applies to response headers and response trailers
+/// at the guest boundary whatever the sender returned.
 ///
 /// An EMPTY `allowlist` denies everything (the misconfiguration guard / safe
 /// default — same observable effect as the old deny-by-default). The interface
@@ -152,22 +208,47 @@ pub struct GatedHttpHooks {
     /// The actual-send step, run only after the gate passes. Injectable for
     /// tests; default = [`default_sender`].
     send: SendFn,
+    /// Request header values dropped by the policy so far (content-blind: a
+    /// count, never names or values) — the analogue of the app's per-origin
+    /// dropped-header log line, for an embedder to audit.
+    dropped_request_headers: usize,
 }
 
 impl GatedHttpHooks {
     /// Build gated hooks with the given origin `allowlist` and the production
     /// (turnkey hyper) sender.
     pub fn new(allowlist: Vec<String>) -> Self {
-        GatedHttpHooks {
-            allowlist,
-            send: Box::new(default_sender),
-        }
+        Self::with_sender(allowlist, Box::new(default_sender))
     }
 
     /// Build gated hooks with a custom (e.g. canned, test) sender. The gate
-    /// still runs first; `send` is reached only on an allowed request.
+    /// still runs first; `send` is reached only on an allowed request, and the
+    /// header policy applies whichever sender is used.
     pub fn with_sender(allowlist: Vec<String>, send: SendFn) -> Self {
-        GatedHttpHooks { allowlist, send }
+        GatedHttpHooks {
+            allowlist,
+            send,
+            dropped_request_headers: 0,
+        }
+    }
+
+    /// How many plugin request header values the policy has dropped so far.
+    pub fn dropped_request_headers(&self) -> usize {
+        self.dropped_request_headers
+    }
+
+    /// Steps 4–6 of [`GatedHttpHooks`]: header policy, send, response
+    /// sanitising. Callers MUST have run the gate (steps 1–3) first; split out
+    /// only so a test can drive the production sender against a loopback
+    /// server the gate would (rightly) refuse.
+    fn send_sanitized(
+        &mut self,
+        mut request: hyper::Request<HyperOutgoingBody>,
+        config: OutgoingRequestConfig,
+    ) -> HttpResult<HostFutureIncomingResponse> {
+        self.dropped_request_headers += retain_allowed_request_headers(request.headers_mut());
+        let response = (self.send)(request, config).map_err(scrub_http_error)?;
+        Ok(sanitize_incoming_response(response))
     }
 }
 
@@ -176,6 +257,94 @@ impl GatedHttpHooks {
 /// cannot distinguish an allowlist miss from an SSRF block (no information leak).
 fn denial_to_error(_denial: FetchDenial) -> ErrorCode {
     ErrorCode::HttpRequestDenied
+}
+
+/// Drop every request header a plugin may not set; returns how many values
+/// were dropped. `Host` is dropped too — the turnkey sender re-derives it from
+/// the (gate-checked) URI authority after this runs.
+fn retain_allowed_request_headers(headers: &mut hyper::HeaderMap) -> usize {
+    let disallowed: Vec<hyper::header::HeaderName> = headers
+        .keys()
+        .filter(|name| !request_policy::is_allowed_request_header(name.as_str()))
+        .cloned()
+        .collect();
+    let mut dropped = 0;
+    for name in disallowed {
+        dropped += headers.get_all(&name).iter().count();
+        headers.remove(&name);
+    }
+    dropped
+}
+
+/// Remove [`request_policy::STRIPPED_RESPONSE_HEADERS`] from response headers.
+fn strip_response_headers(headers: &mut hyper::HeaderMap) {
+    for name in request_policy::STRIPPED_RESPONSE_HEADERS {
+        headers.remove(name);
+    }
+}
+
+/// Blank the free-form text an `ErrorCode` can carry (an internal message, a
+/// DNS rcode, a TLS alert message) so no URL, query or upstream detail reaches
+/// the guest — the analogue of the app's URL-free `NetworkErr.message`. The
+/// error KIND is kept so a guest can still tell a timeout from a refusal.
+fn scrub_error_code(code: ErrorCode) -> ErrorCode {
+    use wasmtime_wasi_http::p2::bindings::http::types::{DnsErrorPayload, TlsAlertReceivedPayload};
+    match code {
+        ErrorCode::InternalError(_) => ErrorCode::InternalError(None),
+        ErrorCode::DnsError(p) => ErrorCode::DnsError(DnsErrorPayload {
+            rcode: None,
+            info_code: p.info_code,
+        }),
+        ErrorCode::TlsAlertReceived(p) => ErrorCode::TlsAlertReceived(TlsAlertReceivedPayload {
+            alert_id: p.alert_id,
+            alert_message: None,
+        }),
+        other => other,
+    }
+}
+
+/// [`scrub_error_code`] for an error returned straight from the sender. A trap
+/// (not an `ErrorCode`) stays a trap: it never reaches the guest as data.
+fn scrub_http_error(err: HttpError) -> HttpError {
+    match err.downcast_ref() {
+        Some(code) => scrub_error_code(code.clone()).into(),
+        None => err,
+    }
+}
+
+/// Apply the response half of the policy to whatever the sender produced:
+/// strip cookie-setting headers, and scrub errors (including errors raised
+/// later while the guest streams the body). A pending response is wrapped in a
+/// task that sanitises it once it resolves; dropping the wrapper (the guest
+/// dropped its future) drops — and so aborts — the inner send.
+fn sanitize_incoming_response(response: HostFutureIncomingResponse) -> HostFutureIncomingResponse {
+    match response {
+        HostFutureIncomingResponse::Ready(result) => {
+            HostFutureIncomingResponse::ready(sanitize_incoming_result(result))
+        }
+        HostFutureIncomingResponse::Pending(handle) => {
+            HostFutureIncomingResponse::pending(wasmtime_wasi::runtime::spawn(async move {
+                sanitize_incoming_result(handle.await)
+            }))
+        }
+        consumed @ HostFutureIncomingResponse::Consumed => consumed,
+    }
+}
+
+fn sanitize_incoming_result(
+    result: wasmtime::Result<Result<IncomingResponse, ErrorCode>>,
+) -> wasmtime::Result<Result<IncomingResponse, ErrorCode>> {
+    use http_body_util::BodyExt;
+    result.map(|inner| match inner {
+        Ok(mut incoming) => {
+            strip_response_headers(incoming.resp.headers_mut());
+            incoming.resp = incoming
+                .resp
+                .map(|body| body.map_err(scrub_error_code).boxed_unsync());
+            Ok(incoming)
+        }
+        Err(code) => Err(scrub_error_code(code)),
+    })
 }
 
 impl wasmtime_wasi_http::p2::WasiHttpHooks for GatedHttpHooks {
@@ -191,8 +360,28 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for GatedHttpHooks {
         if let Err(denial) = fetch_gate::check_request(scheme, host, &self.allowlist) {
             return Err(denial_to_error(denial).into());
         }
-        // Allowed: delegate to the (injectable) real send.
-        (self.send)(request, config)
+        // Doc 30 §4.6: a credential handle on this transport is refused, not
+        // silently dropped — this path never leaves Rust and must not gain
+        // secrets.
+        if request
+            .headers()
+            .keys()
+            .any(|name| request_policy::is_reserved_credential_header(name.as_str()))
+        {
+            return Err(denial_to_error(FetchDenial::CredentialUnsupportedTransport).into());
+        }
+        // Allowed: header policy, the (injectable) real send, response policy.
+        self.send_sanitized(request, config)
+    }
+
+    /// The `wasmtime-wasi-http` defaults plus the cookie-setting response
+    /// headers. The runtime removes forbidden names from incoming response
+    /// headers and trailers before the guest reads them (and refuses them on
+    /// guest-built fields), so `Set-Cookie` cannot reach the guest whichever
+    /// sender produced the response.
+    fn is_forbidden_header(&mut self, name: &hyper::header::HeaderName) -> bool {
+        wasmtime_wasi_http::DEFAULT_FORBIDDEN_HEADERS.contains(name)
+            || request_policy::is_stripped_response_header(name.as_str())
     }
 }
 
@@ -462,6 +651,398 @@ mod tests {
         let result = hooks.send_request(outgoing("http://api.example.com/"), config());
         assert_denied(result, "http scheme must deny");
         assert!(!reached.load(Ordering::SeqCst));
+    }
+
+    // ── Plugin request policy (port of hellohq `PluginRequestPolicy`) ──────
+
+    fn outgoing_with_headers(
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> hyper::Request<HyperOutgoingBody> {
+        let mut builder = hyper::Request::builder().uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(empty_body()).expect("build outbound request")
+    }
+
+    fn allow_example() -> Vec<String> {
+        vec!["api.example.com".to_string()]
+    }
+
+    /// Resolve a sender's response (ready or pending) on the wasmtime-wasi
+    /// tokio runtime, the way the guest-facing `future-incoming-response` does.
+    fn resolve(
+        response: HostFutureIncomingResponse,
+    ) -> wasmtime::Result<Result<IncomingResponse, ErrorCode>> {
+        match response {
+            HostFutureIncomingResponse::Ready(r) => r,
+            HostFutureIncomingResponse::Pending(handle) => wasmtime_wasi::runtime::in_tokio(handle),
+            HostFutureIncomingResponse::Consumed => panic!("response already consumed"),
+        }
+    }
+
+    fn header_names(headers: &hyper::HeaderMap) -> Vec<String> {
+        let mut names: Vec<String> = headers.keys().map(|n| n.as_str().to_string()).collect();
+        names.sort();
+        names
+    }
+
+    /// The Dart suite's allowlist + named-credential + host-controlled cases in
+    /// one request: only the five allowlisted headers reach the sender.
+    #[test]
+    fn wasi_http_02_only_allowlisted_request_headers_reach_the_sender() {
+        let seen: SeenHeaders = Default::default();
+        let mut hooks = GatedHttpHooks::with_sender(
+            allow_example(),
+            canned_response_sender(200, Vec::new(), seen.clone()),
+        );
+        let dropped = [
+            ("Authorization", "Bearer secret"),
+            ("Proxy-Authorization", "Basic c2VjcmV0"),
+            ("Cookie", "session=secret"),
+            ("X-API-Key", "secret"),
+            ("API-Key", "secret"),
+            ("API-Sign", "secret"),
+            ("CB-ACCESS-KEY", "secret"),
+            ("CB-ACCESS-SIGN", "secret"),
+            ("CB-ACCESS-TIMESTAMP", "1"),
+            ("CB-ACCESS-PASSPHRASE", "secret"),
+            ("OK-ACCESS-KEY", "secret"),
+            ("OK-ACCESS-SIGN", "secret"),
+            ("OK-ACCESS-PASSPHRASE", "secret"),
+            ("X-MBX-APIKEY", "secret"),
+            ("X-Auth-Token", "secret"),
+            ("Host", "internal.example"),
+            ("User-Agent", "plugin/1.0"),
+            ("X-Request-Id", "abc"),
+            ("Origin", "https://evil.example"),
+        ];
+        let kept = [
+            ("Accept", "application/json"),
+            ("accept-language", "en-GB"),
+            ("Content-Type", "application/json"),
+            ("IF-NONE-MATCH", "\"etag-1\""),
+            ("If-Modified-Since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ];
+        let all: Vec<(&str, &str)> = dropped.iter().chain(kept.iter()).copied().collect();
+        let result = hooks.send_request(
+            outgoing_with_headers("https://api.example.com/", &all),
+            config(),
+        );
+        assert!(result.is_ok(), "allowlisted origin must pass the gate");
+
+        let mut on_wire = seen.lock().unwrap().clone().expect("sender reached");
+        on_wire.sort();
+        let mut expected: Vec<(String, String)> = kept
+            .iter()
+            .map(|(n, v)| (n.to_ascii_lowercase(), v.to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(on_wire, expected);
+        assert_eq!(hooks.dropped_request_headers(), dropped.len());
+    }
+
+    /// A multi-valued disallowed header is dropped whole and counted per value.
+    #[test]
+    fn wasi_http_02_multi_valued_disallowed_header_dropped_entirely() {
+        let seen: SeenHeaders = Default::default();
+        let mut hooks = GatedHttpHooks::with_sender(
+            allow_example(),
+            canned_response_sender(200, Vec::new(), seen.clone()),
+        );
+        let request = outgoing_with_headers(
+            "https://api.example.com/",
+            &[("cookie", "a=1"), ("cookie", "b=2"), ("accept", "*/*")],
+        );
+        assert!(hooks.send_request(request, config()).is_ok());
+        assert_eq!(
+            seen.lock().unwrap().clone().unwrap(),
+            vec![("accept".to_string(), "*/*".to_string())]
+        );
+        assert_eq!(hooks.dropped_request_headers(), 2);
+    }
+
+    /// No headers at all is a no-op (the Dart "empty map" case).
+    #[test]
+    fn wasi_http_02_no_request_headers_is_a_no_op() {
+        let seen: SeenHeaders = Default::default();
+        let mut hooks = GatedHttpHooks::with_sender(
+            allow_example(),
+            canned_response_sender(200, Vec::new(), seen.clone()),
+        );
+        assert!(hooks
+            .send_request(outgoing("https://api.example.com/"), config())
+            .is_ok());
+        assert_eq!(seen.lock().unwrap().clone().unwrap(), Vec::new());
+        assert_eq!(hooks.dropped_request_headers(), 0);
+    }
+
+    /// Doc 30 §4.6: the reserved credential-handle header is REFUSED on this
+    /// transport (any case), not dropped — and the sender is never reached.
+    #[test]
+    fn wasi_http_02_credential_handle_header_refused() {
+        for name in ["x-hellohq-credential", "X-HelloHQ-Credential"] {
+            let reached = Arc::new(AtomicBool::new(false));
+            let mut hooks =
+                GatedHttpHooks::with_sender(allow_example(), canned_sender(reached.clone()));
+            let request = outgoing_with_headers(
+                "https://api.example.com/",
+                &[(name, "handle-123"), ("accept", "*/*")],
+            );
+            assert_denied(
+                hooks.send_request(request, config()),
+                "a credential handle on wasi:http@0.2 must be refused",
+            );
+            assert!(!reached.load(Ordering::SeqCst), "send must not be reached");
+        }
+    }
+
+    /// The Dart `sanitizeResponseHeaders` case on a READY response.
+    #[test]
+    fn wasi_http_02_set_cookie_stripped_from_ready_response() {
+        let mut hooks = GatedHttpHooks::with_sender(
+            allow_example(),
+            canned_response_sender(
+                200,
+                vec![
+                    ("content-type".into(), "application/json".into()),
+                    ("set-cookie".into(), "session=abc; HttpOnly".into()),
+                    ("Set-Cookie2".into(), "legacy=1".into()),
+                    ("etag".into(), "\"v1\"".into()),
+                ],
+                Default::default(),
+            ),
+        );
+        let response = hooks
+            .send_request(outgoing("https://api.example.com/"), config())
+            .expect("allowed");
+        let incoming = resolve(response).unwrap().unwrap();
+        assert_eq!(
+            header_names(incoming.resp.headers()),
+            ["content-type", "etag"]
+        );
+    }
+
+    /// The same on a PENDING response (the production sender's shape): the
+    /// wrapper task strips the headers once the send resolves.
+    #[test]
+    fn wasi_http_02_set_cookie_stripped_from_pending_response() {
+        let send: SendFn = Box::new(|_req, cfg| {
+            let between = cfg.between_bytes_timeout;
+            Ok(HostFutureIncomingResponse::pending(
+                wasmtime_wasi::runtime::spawn(async move {
+                    let resp = hyper::Response::builder()
+                        .status(200)
+                        .header("set-cookie", "session=abc")
+                        .header("x-ok", "1")
+                        .body(empty_body())
+                        .unwrap();
+                    Ok(Ok(IncomingResponse {
+                        resp,
+                        worker: None,
+                        between_bytes_timeout: between,
+                    }))
+                }),
+            ))
+        });
+        let mut hooks = GatedHttpHooks::with_sender(allow_example(), send);
+        let response = hooks
+            .send_request(outgoing("https://api.example.com/"), config())
+            .expect("allowed");
+        let incoming = resolve(response).unwrap().unwrap();
+        assert_eq!(header_names(incoming.resp.headers()), ["x-ok"]);
+    }
+
+    /// `Set-Cookie` is also a forbidden header, which wasmtime-wasi-http
+    /// applies to response headers + trailers at the guest boundary; the
+    /// library defaults stay forbidden too.
+    #[test]
+    fn forbidden_headers_add_set_cookie_to_the_defaults() {
+        let mut hooks = GatedHttpHooks::new(Vec::new());
+        for name in ["set-cookie", "set-cookie2"] {
+            assert!(hooks.is_forbidden_header(&hyper::header::HeaderName::from_static(name)));
+        }
+        for name in wasmtime_wasi_http::DEFAULT_FORBIDDEN_HEADERS.iter() {
+            assert!(hooks.is_forbidden_header(name), "{name}");
+        }
+        for name in ["etag", "content-type", "location"] {
+            assert!(!hooks.is_forbidden_header(&hyper::header::HeaderName::from_static(name)));
+        }
+    }
+
+    const LEAKY: &str = "https://api.example.com/v1?apikey=SECRET";
+
+    /// No URL / query / free text in an error the sender returns directly.
+    #[test]
+    fn wasi_http_02_sender_error_text_is_scrubbed() {
+        let send: SendFn =
+            Box::new(|_req, _cfg| Err(ErrorCode::InternalError(Some(LEAKY.to_string())).into()));
+        let mut hooks = GatedHttpHooks::with_sender(allow_example(), send);
+        let err = hooks
+            .send_request(outgoing("https://api.example.com/"), config())
+            .expect_err("sender error must surface");
+        assert!(matches!(
+            err.downcast_ref(),
+            Some(ErrorCode::InternalError(None))
+        ));
+    }
+
+    /// ... nor in an error the response future resolves to ...
+    #[test]
+    fn wasi_http_02_response_error_text_is_scrubbed() {
+        let send: SendFn = Box::new(|_req, _cfg| {
+            Ok(HostFutureIncomingResponse::ready(Ok(Err(
+                ErrorCode::DnsError(
+                    wasmtime_wasi_http::p2::bindings::http::types::DnsErrorPayload {
+                        rcode: Some(LEAKY.to_string()),
+                        info_code: Some(3),
+                    },
+                ),
+            ))))
+        });
+        let mut hooks = GatedHttpHooks::with_sender(allow_example(), send);
+        let response = hooks
+            .send_request(outgoing("https://api.example.com/"), config())
+            .expect("allowed");
+        match resolve(response).unwrap() {
+            Err(ErrorCode::DnsError(p)) => {
+                assert_eq!(p.rcode, None);
+                assert_eq!(p.info_code, Some(3), "the error kind/code survives");
+            }
+            other => panic!("expected a scrubbed DnsError, got {other:?}"),
+        }
+    }
+
+    /// ... nor in an error raised while the guest streams the response body.
+    #[test]
+    fn wasi_http_02_body_error_text_is_scrubbed() {
+        use http_body_util::StreamBody;
+        let send: SendFn = Box::new(|_req, cfg| {
+            let failing = StreamBody::new(futures_util::stream::iter(vec![Err::<
+                hyper::body::Frame<Bytes>,
+                ErrorCode,
+            >(
+                ErrorCode::InternalError(Some(LEAKY.to_string())),
+            )]));
+            let resp = hyper::Response::builder()
+                .status(200)
+                .body(failing.boxed_unsync())
+                .unwrap();
+            Ok(HostFutureIncomingResponse::ready(Ok(Ok(
+                IncomingResponse {
+                    resp,
+                    worker: None,
+                    between_bytes_timeout: cfg.between_bytes_timeout,
+                },
+            ))))
+        });
+        let mut hooks = GatedHttpHooks::with_sender(allow_example(), send);
+        let response = hooks
+            .send_request(outgoing("https://api.example.com/"), config())
+            .expect("allowed");
+        let mut body = resolve(response).unwrap().unwrap().resp.into_body();
+        let frame = pollster::block_on(body.frame()).expect("one frame");
+        assert!(
+            matches!(frame, Err(ErrorCode::InternalError(None))),
+            "{frame:?}"
+        );
+    }
+
+    /// The PRODUCTION sender against a real loopback HTTP/1.1 server: a 302 is
+    /// handed back as-is (exactly one request reaches the server — no redirect
+    /// is followed), credential headers never reach the wire, the allowlisted
+    /// one does, and the response's `Set-Cookie` is stripped. Drives
+    /// `send_sanitized` because the gate (rightly) refuses loopback + http.
+    #[test]
+    fn production_sender_does_not_follow_redirects() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Mutex;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let requests: Arc<Mutex<Vec<String>>> = Default::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let requests = requests.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(_) => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf).into_owned());
+                    let reply = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/next\r\n\
+                         Set-Cookie: session=abc\r\nContent-Length: 0\r\n\
+                         Connection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(reply.as_bytes());
+                }
+            })
+        };
+
+        let mut hooks = GatedHttpHooks::new(Vec::new());
+        let request = outgoing_with_headers(
+            &format!("http://127.0.0.1:{port}/start"),
+            &[
+                ("authorization", "Bearer secret"),
+                ("accept", "application/json"),
+            ],
+        );
+        let plain_http = OutgoingRequestConfig {
+            use_tls: false,
+            ..config()
+        };
+        let response = hooks
+            .send_sanitized(request, plain_http)
+            .expect("send must start");
+        let incoming = resolve(response).unwrap().expect("loopback response");
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+
+        assert_eq!(incoming.resp.status(), 302, "the 3xx is returned as-is");
+        assert_eq!(
+            incoming.resp.headers()["location"],
+            format!("http://127.0.0.1:{port}/next").as_str()
+        );
+        assert!(incoming.resp.headers().get("set-cookie").is_none());
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "no redirect may be followed: {requests:?}"
+        );
+        let wire = requests[0].to_ascii_lowercase();
+        assert!(wire.starts_with("get /start "), "{wire}");
+        assert!(wire.contains("accept: application/json"), "{wire}");
+        assert!(
+            !wire.contains("authorization"),
+            "credential on the wire: {wire}"
+        );
+        assert!(!wire.contains("secret"), "credential on the wire: {wire}");
     }
 
     /// The store's `WasiHttpView` hands the linker the gated hooks carrying the

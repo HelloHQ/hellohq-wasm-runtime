@@ -6,9 +6,9 @@
 
 ## Why
 
-HelloHQ's Tier-2 plugin runtime currently drives Wasmtime through the generic C
+HelloHQ's Tier-2 plugin runtime used to drive Wasmtime through the generic C
 API with a **synchronous** custom host ABI. That can't express **async host
-calls** — which is why `ai:inference` is only a stub today and async was deferred.
+calls**, so `ai:inference` was a stub and async was deferred.
 
 This crate exists to deliver those async capabilities: a plugin should be able to
 **stream AI inference** and run **concurrent HTTP**, built on the WebAssembly
@@ -18,46 +18,72 @@ exposes a purpose-built **C ABI** consumed by the Flutter app via `dart:ffi`
 (same integration pattern as [`HelloHQ/mldsa-verify`](https://github.com/HelloHQ/mldsa-verify):
 a native crate behind a C ABI, with SHA-pinned + attested release artifacts).
 
-## Status — SPIKE-STAGE ⚠️
+## Status
 
-Only the C-ABI surface and a runtime self-test are wired (`hwr_abi_version`,
-`hwr_self_test`). The component instantiation, WASI worlds (`wasi:http`, …), and
-the **async-over-FFI bridge** are the deliverables of the **P0 spike** and are
-not implemented yet. Do not depend on this crate's shape until the spike gates
-pass:
+Consumed by the HelloHQ app's Tier-2 plugin runtime, which pins a tagged
+release (SHA-256 + build-provenance attestation, see
+`.github/workflows/release.yml`). The spike
+gates are passed: Component Model + WASI 0.3 async runs on Pulley (no-JIT iOS),
+the bespoke C ABI is in use, and the async-over-FFI bridge drives:
 
-1. **Pulley on iOS** — runs Component-Model + WASI under no-JIT/W^X, within the
-   latency (≤150 ms/invocation) and size (< 8 MB iOS lib) budgets.
-2. **Shim vs C API** — confirm the bespoke C ABI is required (this crate).
-3. **Async-over-FFI + `ai:inference`** — the executor/round-trip bridge.
+- the typed `hellohq:plugin/*` capabilities (`hwr_p3_start_plugin*`, the
+  entrypoint the app binds for a plugin),
+- streaming `wasi:http@0.3` (`hwr_p3s_start_http*`) and `ai:inference`
+  (`hwr_p3s_start_inference*`) over the P3 v2 framed transport,
+- JS (jco) / Go (TinyGo) guests that also import `wasi:*@0.2`
+  (`wasi-guests` feature; not yet exposed through the C ABI).
 
-Plan & gates: `hellohq/docs/51_wasi-0.3-async-runtime-migration.md` (decision)
-and `…/docs/52_wasi-0.3-spike-plan.md` (spike).
+The C ABI is versioned (`HWR_ABI_VERSION`, `hwr_abi_version()`) and declared in
+`include/hellohq_wasm_runtime.h`. Design background: `hellohqworkspace`
+`docs/plugin/18-wasi-0.3-async-runtime-migration.md` and
+`19-wasi-0.3-wit-world-design.md`.
 
 ## Security boundary
 
-Capability **gating stays in the app**, not here: the host implementations of
-`wasi:http` (origin allowlist + SSRF/private-IP blocking), storage, and
-`ai:inference` are wired on the Dart side through HelloHQ's permission gate.
-This crate provides the *mechanism* (run components, surface host imports), not
-the *policy*. `wasi:sockets` is intentionally **not** exposed.
+Capability **gating stays in the app** wherever the app services the call: the
+typed capabilities, `ai:inference` and `wasi:http@0.3` are routed to the Dart
+side, which applies HelloHQ's permission gate and its network policy
+(`PluginNetworkService`: origin allowlist, SSRF/private-IP block, the
+`PluginRequestPolicy` header allowlist). This crate provides the *mechanism*
+there, not the policy.
+
+The one exception is `wasi:http@0.2` for JS/Go guests (`wasi-guests`), which is
+sent from Rust and never reaches Dart. It carries Rust ports of both app
+policies: `src/fetch_gate.rs` (https-only, origin allowlist, SSRF block) and
+`src/request_policy.rs` (request-header allowlist, `Set-Cookie` stripped, no
+redirects, no URLs in errors). The header lists are kept in step with the app
+through a shared case table, `tests/fixtures/plugin_request_policy_cases.txt`.
+`wasi:sockets` is intentionally **not** exposed.
 
 ## Layout
 
 ```
-src/lib.rs   C ABI entrypoints (engine/instance/call/async bridge — being filled in)
-wit/         the hellohq component world (WASI + custom interfaces) [stub]
+src/lib.rs                C ABI entrypoints (engine/instance, P3 round-trip, P3 v2 streaming)
+src/wasi_http.rs          hand-built wasi:http@0.3 host; frames requests to the app
+src/wasi_http_frames.rs   the kind-tagged OUT-frame format of that transport
+src/plugin_host*.rs       typed hellohq:plugin/* hosts bridged to the app (typed-hosts)
+src/wasi_guests.rs        wasi:*@0.2 surface for JS/Go guests, gated wasi:http@0.2
+src/fetch_gate.rs         origin/SSRF gate for that path
+src/request_policy.rs     header policy for that path (port of the app's)
+include/                  the C header
+wit/, wit-wasi*/          the hellohq world and the vendored WASI packages
+tests/                    C-ABI and guest integration tests (fixtures in tests/fixtures)
 ```
 
 ## Build
 
 ```bash
-cargo build            # host (Cranelith JIT)
-cargo test             # ABI + runtime smoke tests
+cargo build                                        # host (Cranelift JIT)
+cargo test --all-targets                           # ABI + runtime tests
+cargo test --features "wasi-http typed-hosts" --all-targets
+cargo test --features "wasi-guests typed-hosts" --all-targets
 ```
 
-Cross-platform release artifacts (desktop dylibs, iOS xcframework via Pulley,
-Android jniLibs) + provenance attestation come with the P1 release pipeline.
+`.github/workflows/ci.yml` lists every feature combination CI runs, including
+the no-JIT (`--no-default-features`) build and the iOS/Android cross-builds.
+Release artifacts (desktop libraries, iOS xcframework via Pulley, Android
+jniLibs) and their provenance attestations come from
+`.github/workflows/release.yml` (`scripts/build-release.sh`).
 
 ## License
 

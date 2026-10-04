@@ -9,7 +9,10 @@
  * the iOS Pulley build (`--no-default-features`). Functions marked [compile]
  * require Cranelift + the `wat` parser and exist only in desktop/Android/CI
  * builds — they are NOT linked into the iOS slice, so the device harness must
- * use the precompiled deserialize path (hwr_instance_new_precompiled).
+ * use the precompiled deserialize path (hwr_instance_new_precompiled). A
+ * feature name in the marker ([wasi-http], [typed-hosts]) means the function
+ * also needs that cargo feature; the release libraries (scripts/
+ * build-release.sh) are built with `wasi-http typed-hosts` on every platform.
  */
 #ifndef HELLOHQ_WASM_RUNTIME_H
 #define HELLOHQ_WASM_RUNTIME_H
@@ -29,6 +32,7 @@ typedef struct HwrEngine HwrEngine;
 typedef struct HwrInstance HwrInstance;
 
 /* ── Handshake / smoke test ──────────────────────────────────────────────── */
+#define HWR_ABI_VERSION 2 /* == hwr_abi_version(); 2 = tagged http OUT frames */
 uint32_t hwr_abi_version(void);          /* [no-JIT] */
 int32_t  hwr_self_test(void);            /* [no-JIT] 1 = runtime links + inits  */
 
@@ -59,6 +63,23 @@ typedef struct HwrP3Session HwrP3Session;
 /* Start a run from a PRECOMPILED component (deserialize) — the iOS path. */
 HwrP3Session* hwr_p3_start(int32_t use_pulley, const uint8_t* component, size_t component_len,
                            const uint8_t* input, size_t input_len);          /* [no-JIT] */
+/* C1 typed-capability runs: the guest imports the typed hellohq:plugin
+ * interfaces; each typed call surfaces as a JSON {"method":…} host call on the
+ * same poll/resolve round-trip. Each comes as a DESERIALIZE variant (precompiled
+ * artifact; the iOS path) and a _compile variant (raw component; Cranelift).
+ *   workspace       — imports hellohq:plugin/workspace, exports run() -> list<u8>
+ *   storage_events  — imports hellohq:plugin/{storage,events}, same export
+ *   plugin          — a real SDK plugin: imports hellohq:plugin/{workspace,
+ *                     storage,events,log}, exports the canonical `guest`
+ *                     interface; drives guest.run(input). The production
+ *                     entrypoint the app binds. */
+HwrP3Session* hwr_p3_start_workspace(int32_t use_pulley, const uint8_t* component,
+                                     size_t component_len);            /* [no-JIT,typed-hosts] */
+HwrP3Session* hwr_p3_start_storage_events(int32_t use_pulley, const uint8_t* component,
+                                          size_t component_len);       /* [no-JIT,typed-hosts] */
+HwrP3Session* hwr_p3_start_plugin(int32_t use_pulley, const uint8_t* component,
+                                  size_t component_len,
+                                  const uint8_t* input, size_t input_len); /* [no-JIT,typed-hosts] */
 int32_t        hwr_p3_poll(HwrP3Session*);            /* [no-JIT] BLOCKS; HWR_P3_*       */
 const uint8_t* hwr_p3_request_ptr(HwrP3Session*);     /* [no-JIT] valid until resolve    */
 size_t         hwr_p3_request_len(HwrP3Session*);     /* [no-JIT] */
@@ -89,7 +110,22 @@ void           hwr_p3s_free(HwrP3Stream*);             /* [no-JIT] closes inboun
 /* ── Compile-time only (Cranelift); NOT in the iOS slice ─────────────────── */
 /* Run the wasi:http guest [component], routing handler.handle through the P3 v2
  * transport: the guest's outbound request surfaces as OUT frames, the caller
- * (Dart) services it (gated) and pushes the response IN. (wasi-http feature.) */
+ * (Dart) services it (gated) and pushes the response IN. (wasi-http feature.)
+ *
+ * http OUT frames (src/wasi_http_frames.rs) — every frame is [kind:u8][payload],
+ * in the order HEAD BODY* TRAILERS?, then OUT_END:
+ *   HWR_HTTP_OUT_HEAD      "{METHOD} {scheme}://{authority}{path}" then
+ *                          "\n{name}: {value}" per header, then at most one
+ *                          "\nx-hellohq-request-options: connect=<ns>;…" line
+ *   HWR_HTTP_OUT_BODY      raw request-body bytes (never empty)
+ *   HWR_HTTP_OUT_TRAILERS  "{name}=<hex(value)>;…" request trailer fields
+ * Dispatch on the kind byte only. Runtimes <= v0.0.2 sent untagged frames (the
+ * head began with the method name). IN frames are unchanged: frame 1 is the
+ * response head "{status}\n{name}: {value}…" (optionally an
+ * "x-hellohq-trailers: {name}=<hex>;…" line), frames 2..N the body. */
+#define HWR_HTTP_OUT_HEAD     0x01
+#define HWR_HTTP_OUT_BODY     0x02
+#define HWR_HTTP_OUT_TRAILERS 0x03
 HwrP3Stream* hwr_p3s_start_http(int32_t use_pulley, const uint8_t* component,
                                 size_t component_len);                          /* [compile,wasi-http] */
 /* Run the hellohq:plugin/inference guest by COMPILING [component] (Cranelift). */
@@ -108,6 +144,18 @@ HwrP3Stream* hwr_p3s_start_inference_precompiled(int32_t use_pulley, const uint8
 /* Start a P3 run by COMPILING a raw component (desktop/Android; host tests). */
 HwrP3Session* hwr_p3_start_compile(int32_t use_pulley, const uint8_t* component, size_t component_len,
                                    const uint8_t* input, size_t input_len);  /* [compile] */
+/* COMPILE variants of the typed-capability runs above. */
+HwrP3Session* hwr_p3_start_workspace_compile(int32_t use_pulley, const uint8_t* component,
+                                             size_t component_len);      /* [compile,typed-hosts] */
+HwrP3Session* hwr_p3_start_storage_events_compile(int32_t use_pulley, const uint8_t* component,
+                                                  size_t component_len); /* [compile,typed-hosts] */
+HwrP3Session* hwr_p3_start_plugin_compile(int32_t use_pulley, const uint8_t* component,
+                                          size_t component_len,
+                                          const uint8_t* input, size_t input_len); /* [compile,typed-hosts] */
+/* P2 smoke test: the gated workspace.read-portfolio-names component. granted != 0
+ * returns `count`; denied returns UINT32_MAX (as i64); INT64_MIN on error. */
+int64_t      hwr_read_portfolio_count(int32_t use_pulley, int32_t granted,
+                                      uint32_t count);                     /* [compile] */
 int64_t      hwr_eval_add(int32_t use_pulley, int32_t a, int32_t b);            /* [compile] */
 int64_t      hwr_eval_component_add(int32_t use_pulley, int32_t a, int32_t b);  /* [compile] */
 int64_t      hwr_eval_host_import(int32_t use_pulley, int32_t x);               /* [compile] */
