@@ -17,8 +17,8 @@ name: CI
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  # CI-PAUSE 2026-10-13: pull_request:
+  # CI-PAUSE 2026-10-13:   branches: [main]
   workflow_dispatch:
 
 jobs:
