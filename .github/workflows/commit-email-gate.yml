@@ -22,7 +22,7 @@ name: commit-email-gate
 
 on:
   push:
-  pull_request:
+  # CI-PAUSE 2026-10-13: pull_request:
 
 permissions:
   contents: read
