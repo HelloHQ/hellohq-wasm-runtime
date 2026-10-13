@@ -12,8 +12,8 @@ name: Release
 # pulley64 artifacts). See scripts/build-release.sh.
 
 on:
-  push:
-    tags: ["v*"]
+  # CI-PAUSE 2026-10-13: push:
+  # CI-PAUSE 2026-10-13:   tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
