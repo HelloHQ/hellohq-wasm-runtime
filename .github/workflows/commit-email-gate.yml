@@ -21,8 +21,9 @@ name: commit-email-gate
 # here is silently reverted by the next rollout.
 
 on:
-  push:
-  # CI-PAUSE 2026-10-13: pull_request:
+  workflow_dispatch:  # CI-PAUSE 2026-10-13: no trigger left
+  # CI-PAUSE 2026-10-13: push:
+  # CI-PAUSE 2026-10-13: # CI-PAUSE 2026-10-13: pull_request:
 
 permissions:
   contents: read
