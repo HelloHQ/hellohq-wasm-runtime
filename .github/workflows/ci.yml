@@ -15,10 +15,10 @@ name: CI
 # portable interpreter, so host execution in the test jobs is representative).
 
 on:
-  # CI-PAUSE 2026-10-13: push:
-  # CI-PAUSE 2026-10-13:   branches: [main]
-  # CI-PAUSE 2026-10-13: # CI-PAUSE 2026-10-13: pull_request:
-  # CI-PAUSE 2026-10-13: # CI-PAUSE 2026-10-13:   branches: [main]
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
