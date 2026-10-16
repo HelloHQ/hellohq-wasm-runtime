@@ -713,6 +713,11 @@ pub unsafe extern "C" fn hwr_instance_call_add(inst: *mut HwrInstance, a: i32, b
     }
     let h = &mut *inst;
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Fuel is per-*store*, and this instance handle is reused across calls,
+        // so replenish the CPU budget for THIS call (#25). A single store can
+        // otherwise run out of fuel across a long session of legitimate calls.
+        // (The P3 paths get a fresh store per run and need no replenish.)
+        h.store.set_fuel(crate::limits::fuel_budget()).ok()?;
         let add = h
             .instance
             .get_typed_func::<(i32, i32), (i32,)>(&mut h.store, "add")
