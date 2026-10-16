@@ -38,6 +38,8 @@ use hellohq::plugin::types::{
 /// Host state: the P3 channel every typed capability call forwards over.
 pub struct TransportPluginHost {
     tx: std::sync::mpsc::Sender<P3Event>,
+    /// Per-store resource limiter (#25): the memory cap attaches here.
+    limits: crate::limits::Limits,
 }
 
 fn api_err(code: &str, message: &str) -> ApiError {
@@ -202,7 +204,7 @@ pub(crate) fn drive_plugin_run(
     input: Vec<u8>,
     tx: std::sync::mpsc::Sender<P3Event>,
 ) -> Result<Vec<u8>, String> {
-    let e2s = |e: wasmtime::Error| e.to_string();
+    let e2s = |e: wasmtime::Error| crate::limits::annotate(&e);
     let mut linker = wasmtime::component::Linker::new(&engine);
     CapstoneHost::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
         &mut linker,
@@ -210,7 +212,15 @@ pub(crate) fn drive_plugin_run(
     )
     .map_err(e2s)?;
 
-    let mut store = wasmtime::Store::new(&engine, TransportPluginHost { tx });
+    let mut store = wasmtime::Store::new(
+        &engine,
+        TransportPluginHost {
+            tx,
+            limits: crate::limits::store_limits(),
+        },
+    );
+    store.limiter(|s| &mut s.limits);
+    store.set_fuel(crate::limits::fuel_budget()).map_err(e2s)?;
     let plugin = CapstoneHost::instantiate(&mut store, &component, &linker).map_err(e2s)?;
     // Outer Result = wasmtime call error; inner = the plugin's `run` result.
     plugin

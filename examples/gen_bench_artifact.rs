@@ -39,6 +39,9 @@ fn main() {
     // Target pulley64 — the no-JIT bytecode iOS deserializes. Cranelift (compile
     // feature) does the compilation here, off-device.
     let mut cfg = Config::new();
+    // Must match `hwr_engine_new` / `p3s_engine`: they enable the CPU fuel budget
+    // (#25), and an artifact compiled without fuel fails to deserialize there.
+    cfg.consume_fuel(true);
     cfg.target("pulley64").expect("pulley64 target");
     let engine = Engine::new(&cfg).expect("engine");
     let component = Component::new(&engine, COMPUTE_COMPONENT_WAT).expect("compile");

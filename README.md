@@ -55,6 +55,28 @@ redirects, no URLs in errors). The header lists are kept in step with the app
 through a shared case table, `tests/fixtures/plugin_request_policy_cases.txt`.
 `wasi:sockets` is intentionally **not** exposed.
 
+## Resource limits
+
+Every guest store is bounded (`hellohq-wasm-runtime#25`, `src/limits.rs`):
+
+- **Memory** — a `StoreLimits` cap of 256 MiB linear memory per instance
+  (`memory.grow` past it returns -1; an over-cap initial memory fails
+  instantiation). Restores the cap the retired in-app `PluginWasmService` used.
+- **CPU** — a per-run budget in Wasmtime **fuel** (default 1e9, same as the
+  retired service; override with `hwr_set_fuel_budget`). Fuel counts executed
+  Wasm only, so a plugin parked on a host call waiting for the app is never
+  charged for the app's latency — the misfire a wall-clock epoch deadline would
+  have. A guest that exhausts the budget traps.
+
+Either limit surfaces to the app as an `HWR_P3_ERROR` / `HWR_P3S_ERROR` message
+prefixed with `hellohq-plugin-cpu-limit:` or `hellohq-plugin-memory-limit:`.
+
+**Artifact contract:** fuel is a compile-time engine setting, so a precompiled
+(AOT) artifact must be compiled with fuel enabled — by this runtime version — or
+`Component::deserialize` rejects it. `hwr_engine_new`/`hwr_precompile_component`
+and the P3 run engines share the setting, so artifacts produced by this crate
+round-trip; artifacts precompiled by an older release must be regenerated.
+
 ## Layout
 
 ```

@@ -36,6 +36,22 @@ typedef struct HwrInstance HwrInstance;
 uint32_t hwr_abi_version(void);          /* [no-JIT] */
 int32_t  hwr_self_test(void);            /* [no-JIT] 1 = runtime links + inits  */
 
+/* ── Per-run resource limits (#25) ───────────────────────────────────────── */
+/* Every guest store is capped: linear memory at 256 MiB (memory.grow past it
+ * returns -1; an over-cap initial memory fails instantiation), and CPU at a
+ * per-run budget measured in Wasmtime *fuel* units (a guest parked on a host
+ * call waiting for the app is NOT charged — fuel counts executed Wasm only).
+ * A run that exhausts the CPU budget ends as HWR_P3_ERROR / HWR_P3S_ERROR with a
+ * message prefixed by a stable code the app matches:
+ *     "hellohq-plugin-cpu-limit: …"     — the guest ran out of CPU budget
+ *     "hellohq-plugin-memory-limit: …"  — the guest exceeded the memory cap
+ *
+ * NOTE: the CPU budget is a compile-time engine setting (Wasmtime fuel). A
+ * precompiled (AOT) artifact must therefore be compiled WITH fuel enabled — i.e.
+ * by this runtime version — or `Component::deserialize` rejects it. Re-precompile
+ * artifacts when adopting this version. */
+void     hwr_set_fuel_budget(uint64_t fuel);  /* [no-JIT] 0 = default (1e9) */
+
 /* ── Engine + instance lifecycle (the iOS execution path) ────────────────── */
 HwrEngine*   hwr_engine_new(int32_t use_pulley);                 /* [no-JIT] */
 void         hwr_engine_free(HwrEngine* engine);                 /* [no-JIT] */

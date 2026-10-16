@@ -55,9 +55,19 @@ pub(crate) struct InferenceTransport {
 /// Carries the [`InferenceTransport`]: `complete` frames the request OUT to the
 /// caller and builds the returned `stream<string>` from the caller's inbound
 /// token frames. Mirrors `wasi_http::WasiHttpHost`.
-#[derive(Default)]
 pub struct InferenceHost {
     pub(crate) transport: Option<InferenceTransport>,
+    /// Per-store resource limiter (#25): the memory cap attaches here.
+    pub(crate) limits: crate::limits::Limits,
+}
+
+impl Default for InferenceHost {
+    fn default() -> Self {
+        InferenceHost {
+            transport: None,
+            limits: crate::limits::store_limits(),
+        }
+    }
 }
 
 impl InferenceHost {
@@ -68,6 +78,7 @@ impl InferenceHost {
                 out,
                 inbound: Some(inbound),
             }),
+            limits: crate::limits::store_limits(),
         }
     }
 
