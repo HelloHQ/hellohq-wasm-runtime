@@ -114,6 +114,11 @@ pub mod fetch_gate;
 // then run in every CI job, not only under `wasi-guests`.
 pub mod request_policy;
 
+// Per-run resource limits for a guest (#25): a memory cap on every store and a
+// CPU (fuel) budget per run, with the typed errors the app maps to user-facing
+// messages. Plain Rust + Wasmtime only, so it is in every build.
+pub mod limits;
+
 // C1: transport-backed TYPED capability hosts. Each typed import is forwarded
 // over the P3 round-trip to the app (Dart), bridging to/from the existing JSON
 // host-call wire. Behind `typed-hosts` (pulls serde_json); see the feature note.
@@ -429,6 +434,17 @@ pub extern "C" fn hwr_abi_version() -> u32 {
     HWR_ABI_VERSION
 }
 
+/// Set the per-run CPU budget, in WebAssembly fuel units (#25), process-wide.
+/// `0` restores the default (1e9, the value the retired `PluginWasmService`
+/// used). Additive to the ABI — a caller that never calls it gets the default.
+///
+/// # Safety
+/// None — takes a plain integer.
+#[no_mangle]
+pub extern "C" fn hwr_set_fuel_budget(fuel: u64) {
+    limits::set_fuel_budget(fuel);
+}
+
 /// Smoke test: constructs a default Wasmtime engine to prove the native runtime
 /// links and initialises on this platform/backend. Returns `1` on success, `0`
 /// on failure or panic. Used by the FFI harness and the Spike-1 iOS probe.
@@ -606,6 +622,10 @@ pub struct HwrEngine {
 pub extern "C" fn hwr_engine_new(use_pulley: i32) -> *mut HwrEngine {
     std::panic::catch_unwind(|| {
         let mut cfg = wasmtime::Config::new();
+        // The precompile/instance engines must match the run engines' config, or
+        // an artifact compiled here fails to deserialize in a P3 run (#25). Fuel
+        // is such a setting: enable it on both sides.
+        limits::configure_engine(&mut cfg);
         if use_pulley != 0 {
             cfg.target("pulley64").ok()?;
         }
@@ -660,6 +680,7 @@ pub unsafe extern "C" fn hwr_instance_new(
         let component = wasmtime::component::Component::new(eng, wasm).ok()?;
         let linker = wasmtime::component::Linker::new(eng);
         let mut store = wasmtime::Store::new(eng, ());
+        store.set_fuel(crate::limits::fuel_budget()).ok()?;
         let instance = linker.instantiate(&mut store, &component).ok()?;
         Some(Box::into_raw(Box::new(HwrInstance { store, instance })))
     }))
@@ -776,6 +797,7 @@ pub unsafe extern "C" fn hwr_instance_new_precompiled(
         let component = wasmtime::component::Component::deserialize(eng, artifact).ok()?;
         let linker = wasmtime::component::Linker::new(eng);
         let mut store = wasmtime::Store::new(eng, ());
+        store.set_fuel(crate::limits::fuel_budget()).ok()?;
         let instance = linker.instantiate(&mut store, &component).ok()?;
         Some(Box::into_raw(Box::new(HwrInstance { store, instance })))
     }))
@@ -827,10 +849,27 @@ pub struct HwrP3Session {
 /// only instantiates + runs; compilation happened off-device.
 fn p3_engine(use_pulley: bool) -> wasmtime::Result<wasmtime::Engine> {
     let mut cfg = wasmtime::Config::new();
+    limits::configure_engine(&mut cfg);
     if use_pulley {
         cfg.target("pulley64")?;
     }
     wasmtime::Engine::new(&cfg)
+}
+
+/// Store state for the generic probe path: the P3 channel plus the per-store
+/// resource limiter (#25) the memory cap rides on.
+pub(crate) struct ProbeStore {
+    pub(crate) tx: std::sync::mpsc::Sender<P3Event>,
+    pub(crate) limits: crate::limits::Limits,
+}
+
+impl ProbeStore {
+    fn new(tx: std::sync::mpsc::Sender<P3Event>) -> Self {
+        ProbeStore {
+            tx,
+            limits: crate::limits::store_limits(),
+        }
+    }
 }
 
 /// The worker-thread future: wire the gated `hostcall.call` host import (routes
@@ -842,19 +881,18 @@ async fn p3_drive(
     input: Vec<u8>,
     tx: std::sync::mpsc::Sender<P3Event>,
 ) -> Result<Vec<u8>, String> {
-    let e2s = |e: wasmtime::Error| e.to_string();
-    let mut linker = wasmtime::component::Linker::<std::sync::mpsc::Sender<P3Event>>::new(engine);
+    let e2s = |e: wasmtime::Error| crate::limits::annotate(&e);
+    let mut linker = wasmtime::component::Linker::<ProbeStore>::new(engine);
     linker
         .instance("hellohq:plugin/hostcall@0.1.0")
         .map_err(e2s)?
         .func_wrap_async(
             "call",
-            |store: wasmtime::StoreContextMut<'_, std::sync::mpsc::Sender<P3Event>>,
-             (request,): (Vec<u8>,)| {
+            |store: wasmtime::StoreContextMut<'_, ProbeStore>, (request,): (Vec<u8>,)| {
                 // Surface the request synchronously; the future just waits for
                 // the caller-supplied response (the guest is suspended here).
                 let (respond, rx) = futures_channel::oneshot::channel();
-                let _ = store.data().send(P3Event::HostCall { request, respond });
+                let _ = store.data().tx.send(P3Event::HostCall { request, respond });
                 Box::new(async move {
                     match rx.await {
                         Ok(resp) => Ok((resp,)),
@@ -865,7 +903,9 @@ async fn p3_drive(
         )
         .map_err(e2s)?;
 
-    let mut store = wasmtime::Store::new(engine, tx);
+    let mut store = wasmtime::Store::new(engine, ProbeStore::new(tx));
+    store.limiter(|s| &mut s.limits);
+    store.set_fuel(crate::limits::fuel_budget()).map_err(e2s)?;
     let instance = linker
         .instantiate_async(&mut store, component)
         .await
@@ -1650,6 +1690,7 @@ pub unsafe extern "C" fn hwr_p3s_result_len(session: *mut HwrP3Stream) -> usize 
 #[cfg(feature = "wasi-http")]
 fn p3s_engine(use_pulley: bool) -> Option<wasmtime::Engine> {
     let mut cfg = wasmtime::Config::new();
+    limits::configure_engine(&mut cfg);
     cfg.wasm_component_model(true);
     cfg.wasm_component_model_async(true);
     cfg.concurrency_support(true);
@@ -1666,13 +1707,15 @@ fn p3s_http_session(
     component: wasmtime::component::Component,
 ) -> *mut HwrP3Stream {
     let session = p3s_run_session(move |out, in_rx| async move {
-        let e2s = |e: wasmtime::Error| e.to_string();
+        let e2s = |e: wasmtime::Error| crate::limits::annotate(&e);
         let mut linker =
             wasmtime::component::Linker::<crate::wasi_http::WasiHttpHost>::new(&engine);
         crate::wasi_http::WasiHttpHost::add_to_linker(&mut linker).map_err(e2s)?;
 
         let host = crate::wasi_http::WasiHttpHost::with_transport(out, in_rx);
         let mut store = wasmtime::Store::new(&engine, host);
+        store.limiter(|s| &mut s.limits);
+        store.set_fuel(crate::limits::fuel_budget()).map_err(e2s)?;
         let instance = linker
             .instantiate_async(&mut store, &component)
             .await
@@ -1693,13 +1736,15 @@ fn p3s_inference_session(
     component: wasmtime::component::Component,
 ) -> *mut HwrP3Stream {
     let session = p3s_run_session(move |out, in_rx| async move {
-        let e2s = |e: wasmtime::Error| e.to_string();
+        let e2s = |e: wasmtime::Error| crate::limits::annotate(&e);
         let mut linker =
             wasmtime::component::Linker::<crate::inference::InferenceHost>::new(&engine);
         crate::inference::InferenceHost::add_to_linker(&mut linker).map_err(e2s)?;
 
         let host = crate::inference::InferenceHost::with_transport(out, in_rx);
         let mut store = wasmtime::Store::new(&engine, host);
+        store.limiter(|s| &mut s.limits);
+        store.set_fuel(crate::limits::fuel_budget()).map_err(e2s)?;
         let instance = linker
             .instantiate_async(&mut store, &component)
             .await

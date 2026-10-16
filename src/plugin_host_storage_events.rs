@@ -37,6 +37,8 @@ use hellohq::plugin::types::ApiError;
 /// Host state: the P3 channel each typed `storage`/`events` call forwards over.
 pub struct TransportStorageEventsHost {
     tx: std::sync::mpsc::Sender<P3Event>,
+    /// Per-store resource limiter (#25): the memory cap attaches here.
+    limits: crate::limits::Limits,
 }
 
 fn api_err(code: &str, message: &str) -> ApiError {
@@ -143,7 +145,7 @@ pub(crate) fn drive_storage_events_run(
     component: wasmtime::component::Component,
     tx: std::sync::mpsc::Sender<P3Event>,
 ) -> Result<Vec<u8>, String> {
-    let e2s = |e: wasmtime::Error| e.to_string();
+    let e2s = |e: wasmtime::Error| crate::limits::annotate(&e);
     let mut linker = wasmtime::component::Linker::new(&engine);
     StorageEventsGuest::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
         &mut linker,
@@ -151,7 +153,15 @@ pub(crate) fn drive_storage_events_run(
     )
     .map_err(e2s)?;
 
-    let mut store = wasmtime::Store::new(&engine, TransportStorageEventsHost { tx });
+    let mut store = wasmtime::Store::new(
+        &engine,
+        TransportStorageEventsHost {
+            tx,
+            limits: crate::limits::store_limits(),
+        },
+    );
+    store.limiter(|s| &mut s.limits);
+    store.set_fuel(crate::limits::fuel_budget()).map_err(e2s)?;
     let guest = StorageEventsGuest::instantiate(&mut store, &component, &linker).map_err(e2s)?;
     guest.call_run(&mut store).map_err(e2s)
 }

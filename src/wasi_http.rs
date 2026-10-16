@@ -297,7 +297,6 @@ pub(crate) struct HttpTransport {
 /// optionally carries a [`HttpTransport`]: when `Some`, `handler::handle` routes
 /// through the P3 v2 transport (a gated fetch the caller services); when `None`,
 /// it keeps synthesizing the in-process echo response.
-#[derive(Default)]
 pub struct WasiHttpHost {
     fields: Table<FieldsData>,
     requests: Table<RequestData>,
@@ -305,6 +304,21 @@ pub struct WasiHttpHost {
     options: Table<RequestOptionsData>,
     /// STAGE 4 P3 transport; `None` on the synthetic in-process path.
     pub(crate) transport: Option<HttpTransport>,
+    /// Per-store resource limiter (#25): the memory cap attaches here.
+    pub(crate) limits: crate::limits::Limits,
+}
+
+impl Default for WasiHttpHost {
+    fn default() -> Self {
+        WasiHttpHost {
+            fields: Table::default(),
+            requests: Table::default(),
+            responses: Table::default(),
+            options: Table::default(),
+            transport: None,
+            limits: crate::limits::store_limits(),
+        }
+    }
 }
 
 impl WasiHttpHost {

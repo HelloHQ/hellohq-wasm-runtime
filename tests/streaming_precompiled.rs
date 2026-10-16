@@ -28,6 +28,9 @@ fn precompile_pulley(wasm: &[u8]) -> Vec<u8> {
     cfg.wasm_component_model(true);
     cfg.wasm_component_model_async(true);
     cfg.concurrency_support(true);
+    // Must match the run engine (`p3s_engine`): it enables the CPU fuel budget
+    // (#25), and an artifact compiled without fuel fails to deserialize there.
+    cfg.consume_fuel(true);
     cfg.target("pulley64").expect("target pulley64");
     let engine = wasmtime::Engine::new(&cfg).expect("engine");
     let component = wasmtime::component::Component::new(&engine, wasm).expect("compile component");
