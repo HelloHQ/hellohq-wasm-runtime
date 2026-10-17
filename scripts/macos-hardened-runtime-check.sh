@@ -120,7 +120,16 @@ fi
 
 sign no-jit
 run no-jit
-if [[ $RC -eq 0 ]]; then
+if [[ $RC -eq 0 && "$OUT" == *"mmap(MAP_JIT) in this process: allowed"* ]]; then
+  # The host does not enforce the hardened runtime's JIT rules: MAP_JIT was
+  # granted without allow-jit (GitHub's macOS VMs do this). The negative case
+  # proves nothing here; the allow-jit case above still proved, by its own
+  # publish counts, that every load used MAP_JIT memory. On a real Mac this
+  # case is refused, and anything else that runs is a failure.
+  msg="this host does not enforce the hardened runtime (MAP_JIT allowed without allow-jit), so the no-entitlement case is not checked here; run this script on a real Mac to check it"
+  echo "SKIP  hardened, no entitlements: $msg"
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then echo "::warning title=hardened-runtime check::$msg"; fi
+elif [[ $RC -eq 0 ]]; then
   echo "FAIL  hardened, no entitlements: guest code ran without allow-jit"
   failures=$((failures + 1))
 elif [[ $RC -eq 137 ]]; then

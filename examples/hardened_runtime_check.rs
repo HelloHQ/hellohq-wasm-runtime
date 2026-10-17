@@ -160,5 +160,20 @@ fn main() {
         println!("ok: hwr_p3_start_plugin (hello-world, precompiled native artifact) -> {out}");
     }
 
+    // Prove the code above ran from MAP_JIT memory. On a host that enforces the
+    // hardened runtime the fallback could not have run at all, but on one that
+    // does not (GitHub's macOS VMs) it would, so count where the runtime
+    // published its code: every run must have used MAP_JIT and none the
+    // mprotect fallback.
+    #[cfg(target_os = "macos")]
+    {
+        let (map_jit, fallback) = hellohq_wasm_runtime::jit_memory::publish_counts();
+        println!("code memory: {map_jit} published from MAP_JIT, {fallback} by the fallback");
+        println!("{}", map_jit_probe());
+        if map_jit == 0 || fallback != 0 {
+            fail("the runtime's code was not all published from MAP_JIT memory");
+        }
+    }
+
     println!("hardened-runtime-check: PASS");
 }

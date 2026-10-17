@@ -70,6 +70,27 @@
 use wasmtime::component::Component;
 use wasmtime::{Config, Engine, Module, Result};
 
+/// `(code published from MAP_JIT memory, code published by the stock mprotect
+/// fallback)` across the whole process so far. Diagnostics only: the
+/// hardened-runtime check uses it to prove the runtime's code really came from
+/// `MAP_JIT` memory on hosts that do not enforce the hardened runtime (CI VMs),
+/// where the fallback would also run. Always `(0, 0)` off macOS.
+#[doc(hidden)]
+pub fn publish_counts() -> (usize, usize) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            macos::stats::MAP_JIT_TOTAL.load(Relaxed),
+            macos::stats::FALLBACK_TOTAL.load(Relaxed),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        (0, 0)
+    }
+}
+
 /// Install the `MAP_JIT` code-memory hook on `cfg` (macOS only; a no-op
 /// elsewhere). Call it from every engine builder that runs guest code, and load
 /// that engine's code with the functions in this module.
@@ -426,12 +447,22 @@ mod macos {
             super::lock(&super::PENDING).iter().any(|r| r.base == base)
         }
 
+        /// Process-wide totals, for diagnostics (`super::super::publish_counts`).
+        /// The per-thread `COUNTS` above stay the tests' measure, so parallel
+        /// tests do not see each other's loads.
+        pub(in super::super) static MAP_JIT_TOTAL: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        pub(in super::super) static FALLBACK_TOTAL: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+
         pub(in super::super) fn note_map_jit() {
+            MAP_JIT_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             #[cfg(test)]
             COUNTS.with(|c| c.set((c.get().0 + 1, c.get().1)));
         }
 
         pub(in super::super) fn note_fallback() {
+            FALLBACK_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             #[cfg(test)]
             COUNTS.with(|c| c.set((c.get().0, c.get().1 + 1)));
         }
