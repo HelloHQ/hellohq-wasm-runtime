@@ -119,6 +119,12 @@ pub mod request_policy;
 // messages. Plain Rust + Wasmtime only, so it is in every build.
 pub mod limits;
 
+// Executable code memory: on macOS every native (non-Pulley) engine's code lives
+// in MAP_JIT memory, the only kind the hardened runtime's allow-jit entitlement
+// lets us execute. Every engine builder calls `jit_memory::configure` and loads
+// code through its `compile_*` / `deserialize_*` functions.
+pub mod jit_memory;
+
 // C1: transport-backed TYPED capability hosts. Each typed import is forwarded
 // over the P3 round-trip to the app (Dart), bridging to/from the existing JSON
 // host-call wire. Behind `typed-hosts` (pulls serde_json); see the feature note.
@@ -156,7 +162,7 @@ pub const HWR_ABI_VERSION: u32 = 2;
 // in `compile` builds (desktop/Android/CI). iOS (no-JIT) builds omit Cranelift
 // and will run precompiled Pulley bytecode via the deserialize path (P1).
 #[cfg(feature = "compile")]
-use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store};
+use wasmtime::{Caller, Config, Engine, Instance, Linker, Store};
 
 /// Tiny module used to prove real Wasm executes end-to-end on each backend.
 #[cfg(feature = "compile")]
@@ -170,6 +176,7 @@ const ADD_WAT: &str = r#"(module
 #[cfg(feature = "compile")]
 fn make_engine(use_pulley: bool) -> wasmtime::Result<Engine> {
     let mut cfg = Config::new();
+    crate::jit_memory::configure(&mut cfg);
     if use_pulley {
         // 64-bit little-endian host triple; the spike/P1 derives this per target.
         cfg.target("pulley64")?;
@@ -181,7 +188,7 @@ fn make_engine(use_pulley: bool) -> wasmtime::Result<Engine> {
 #[cfg(feature = "compile")]
 fn run_add(use_pulley: bool, a: i32, b: i32) -> wasmtime::Result<i32> {
     let engine = make_engine(use_pulley)?;
-    let module = Module::new(&engine, ADD_WAT)?;
+    let module = crate::jit_memory::compile_module(&engine, ADD_WAT)?;
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[])?;
     let add = instance.get_typed_func::<(i32, i32), i32>(&mut store, "add")?;
@@ -204,9 +211,9 @@ const ADD_COMPONENT_WAT: &str = r#"(component
 /// the selected backend (Cranelift JIT or Pulley interpreter).
 #[cfg(feature = "compile")]
 fn run_component_add(use_pulley: bool, a: i32, b: i32) -> wasmtime::Result<i32> {
-    use wasmtime::component::{Component, Linker};
+    use wasmtime::component::Linker;
     let engine = make_engine(use_pulley)?;
-    let component = Component::new(&engine, ADD_COMPONENT_WAT)?;
+    let component = crate::jit_memory::compile_component(&engine, ADD_COMPONENT_WAT)?;
     let linker = Linker::new(&engine);
     let mut store = Store::new(&engine, ());
     let instance = linker.instantiate(&mut store, &component)?;
@@ -241,9 +248,9 @@ const HOST_IMPORT_COMPONENT_WAT: &str = r#"(component
 /// and calls `run(x)` (which calls back into the host). Returns `2·x`.
 #[cfg(feature = "compile")]
 fn run_component_host_import(use_pulley: bool, x: u32) -> wasmtime::Result<u32> {
-    use wasmtime::component::{Component, Linker};
+    use wasmtime::component::Linker;
     let engine = make_engine(use_pulley)?;
-    let component = Component::new(&engine, HOST_IMPORT_COMPONENT_WAT)?;
+    let component = crate::jit_memory::compile_component(&engine, HOST_IMPORT_COMPONENT_WAT)?;
     let mut linker = Linker::new(&engine);
     linker.root().func_wrap(
         "host-double",
@@ -288,9 +295,9 @@ const WORKSPACE_READ_COMPONENT_WAT: &str = r#"(component
 /// the component world and the gate, on both backends.
 #[cfg(feature = "compile")]
 fn run_gated_workspace_read(use_pulley: bool, granted: bool, count: u32) -> wasmtime::Result<u32> {
-    use wasmtime::component::{Component, Linker};
+    use wasmtime::component::Linker;
     let engine = make_engine(use_pulley)?;
-    let component = Component::new(&engine, WORKSPACE_READ_COMPONENT_WAT)?;
+    let component = crate::jit_memory::compile_component(&engine, WORKSPACE_READ_COMPONENT_WAT)?;
     let mut linker = Linker::new(&engine);
     linker.root().func_wrap(
         "read-portfolio-names",
@@ -325,11 +332,12 @@ const ASYNC_WAT: &str = r#"(module
 #[cfg(feature = "compile")]
 async fn run_async_double(use_pulley: bool, x: i32) -> wasmtime::Result<i32> {
     let mut cfg = Config::new();
+    crate::jit_memory::configure(&mut cfg);
     if use_pulley {
         cfg.target("pulley64")?;
     }
     let engine = Engine::new(&cfg)?;
-    let module = Module::new(&engine, ASYNC_WAT)?;
+    let module = crate::jit_memory::compile_module(&engine, ASYNC_WAT)?;
     let mut linker = Linker::new(&engine);
     linker.func_wrap_async("host", "double", |_caller: Caller<'_, ()>, (v,): (i32,)| {
         // The Wasm guest suspends here while this future runs, then resumes.
@@ -354,14 +362,15 @@ async fn run_async_double(use_pulley: bool, x: i32) -> wasmtime::Result<i32> {
 /// streams/futures is the next increment, also reachable on 45.)
 #[cfg(feature = "compile")]
 async fn run_component_async_double(use_pulley: bool, x: u32) -> wasmtime::Result<u32> {
-    use wasmtime::component::{Component, Linker};
+    use wasmtime::component::Linker;
     let mut cfg = Config::new();
+    crate::jit_memory::configure(&mut cfg);
     cfg.wasm_component_model_async(true);
     if use_pulley {
         cfg.target("pulley64")?;
     }
     let engine = Engine::new(&cfg)?;
-    let component = Component::new(&engine, HOST_IMPORT_COMPONENT_WAT)?;
+    let component = crate::jit_memory::compile_component(&engine, HOST_IMPORT_COMPONENT_WAT)?;
     let mut linker = Linker::new(&engine);
     linker.root().func_wrap_async(
         "host-double",
@@ -409,14 +418,15 @@ const CANON_ASYNC_WAT: &str = r#"(component
 /// (sync) type was still accepted.
 #[cfg(feature = "compile")]
 async fn run_canonical_async_double(use_pulley: bool, x: u32) -> wasmtime::Result<u32> {
-    use wasmtime::component::{Component, Linker};
+    use wasmtime::component::Linker;
     let mut cfg = Config::new();
+    crate::jit_memory::configure(&mut cfg);
     cfg.wasm_component_model_async(true);
     if use_pulley {
         cfg.target("pulley64")?;
     }
     let engine = Engine::new(&cfg)?;
-    let component = Component::new(&engine, CANON_ASYNC_WAT)?;
+    let component = crate::jit_memory::compile_component(&engine, CANON_ASYNC_WAT)?;
     let linker = Linker::new(&engine);
     let mut store = Store::new(&engine, ());
     let instance = linker.instantiate_async(&mut store, &component).await?;
@@ -622,6 +632,7 @@ pub struct HwrEngine {
 pub extern "C" fn hwr_engine_new(use_pulley: i32) -> *mut HwrEngine {
     std::panic::catch_unwind(|| {
         let mut cfg = wasmtime::Config::new();
+        crate::jit_memory::configure(&mut cfg);
         // The precompile/instance engines must match the run engines' config, or
         // an artifact compiled here fails to deserialize in a P3 run (#25). Fuel
         // is such a setting: enable it on both sides.
@@ -677,7 +688,7 @@ pub unsafe extern "C" fn hwr_instance_new(
     let eng = &(*engine).engine;
     let wasm = std::slice::from_raw_parts(bytes, len);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let component = wasmtime::component::Component::new(eng, wasm).ok()?;
+        let component = crate::jit_memory::compile_component(eng, wasm).ok()?;
         let linker = wasmtime::component::Linker::new(eng);
         let mut store = wasmtime::Store::new(eng, ());
         store.set_fuel(crate::limits::fuel_budget()).ok()?;
@@ -799,7 +810,7 @@ pub unsafe extern "C" fn hwr_instance_new_precompiled(
     let eng = &(*engine).engine;
     let artifact = std::slice::from_raw_parts(bytes, len);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let component = wasmtime::component::Component::deserialize(eng, artifact).ok()?;
+        let component = crate::jit_memory::deserialize_component(eng, artifact).ok()?;
         let linker = wasmtime::component::Linker::new(eng);
         let mut store = wasmtime::Store::new(eng, ());
         store.set_fuel(crate::limits::fuel_budget()).ok()?;
@@ -854,6 +865,7 @@ pub struct HwrP3Session {
 /// only instantiates + runs; compilation happened off-device.
 fn p3_engine(use_pulley: bool) -> wasmtime::Result<wasmtime::Engine> {
     let mut cfg = wasmtime::Config::new();
+    crate::jit_memory::configure(&mut cfg);
     limits::configure_engine(&mut cfg);
     if use_pulley {
         cfg.target("pulley64")?;
@@ -1036,7 +1048,7 @@ pub unsafe extern "C" fn hwr_p3_start(
         };
         // SAFETY: caller guarantees the bytes came from this runtime's
         // precompile/serialize (the trust boundary is the SHA-pinned fetch).
-        let component = match wasmtime::component::Component::deserialize(&engine, comp_bytes) {
+        let component = match crate::jit_memory::deserialize_component(&engine, comp_bytes) {
             Ok(c) => c,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1074,7 +1086,7 @@ pub unsafe extern "C" fn hwr_p3_start_compile(
             Ok(e) => e,
             Err(_) => return std::ptr::null_mut(),
         };
-        let component = match wasmtime::component::Component::new(&engine, comp_bytes) {
+        let component = match crate::jit_memory::compile_component(&engine, comp_bytes) {
             Ok(c) => c,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1146,7 +1158,7 @@ pub unsafe extern "C" fn hwr_p3_start_workspace_compile(
             Ok(e) => e,
             Err(_) => return std::ptr::null_mut(),
         };
-        let component = match wasmtime::component::Component::new(&engine, comp_bytes) {
+        let component = match crate::jit_memory::compile_component(&engine, comp_bytes) {
             Ok(c) => c,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1182,7 +1194,7 @@ pub unsafe extern "C" fn hwr_p3_start_workspace(
         };
         // SAFETY: caller guarantees the bytes came from this runtime's
         // precompile/serialize (the trust boundary is the SHA-pinned fetch).
-        let component = match wasmtime::component::Component::deserialize(&engine, comp_bytes) {
+        let component = match crate::jit_memory::deserialize_component(&engine, comp_bytes) {
             Ok(c) => c,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1216,7 +1228,7 @@ pub unsafe extern "C" fn hwr_p3_start_storage_events_compile(
             Ok(e) => e,
             Err(_) => return std::ptr::null_mut(),
         };
-        let component = match wasmtime::component::Component::new(&engine, comp_bytes) {
+        let component = match crate::jit_memory::compile_component(&engine, comp_bytes) {
             Ok(c) => c,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1251,7 +1263,7 @@ pub unsafe extern "C" fn hwr_p3_start_storage_events(
         };
         // SAFETY: caller guarantees the bytes came from this runtime's
         // precompile/serialize (the trust boundary is the SHA-pinned fetch).
-        let component = match wasmtime::component::Component::deserialize(&engine, comp_bytes) {
+        let component = match crate::jit_memory::deserialize_component(&engine, comp_bytes) {
             Ok(c) => c,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1294,7 +1306,7 @@ pub unsafe extern "C" fn hwr_p3_start_plugin_compile(
             Ok(e) => e,
             Err(_) => return std::ptr::null_mut(),
         };
-        let component = match wasmtime::component::Component::new(&engine, comp_bytes) {
+        let component = match crate::jit_memory::compile_component(&engine, comp_bytes) {
             Ok(c) => c,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1336,7 +1348,7 @@ pub unsafe extern "C" fn hwr_p3_start_plugin(
         };
         // SAFETY: caller guarantees the bytes came from this runtime's
         // precompile/serialize (the trust boundary is the SHA-pinned fetch).
-        let component = match wasmtime::component::Component::deserialize(&engine, comp_bytes) {
+        let component = match crate::jit_memory::deserialize_component(&engine, comp_bytes) {
             Ok(c) => c,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1695,6 +1707,7 @@ pub unsafe extern "C" fn hwr_p3s_result_len(session: *mut HwrP3Stream) -> usize 
 #[cfg(feature = "wasi-http")]
 fn p3s_engine(use_pulley: bool) -> Option<wasmtime::Engine> {
     let mut cfg = wasmtime::Config::new();
+    crate::jit_memory::configure(&mut cfg);
     limits::configure_engine(&mut cfg);
     cfg.wasm_component_model(true);
     cfg.wasm_component_model_async(true);
@@ -1791,7 +1804,7 @@ pub unsafe extern "C" fn hwr_p3s_start_http(
             Some(e) => e,
             None => return std::ptr::null_mut(),
         };
-        let component = match wasmtime::component::Component::new(&engine, &comp_bytes) {
+        let component = match crate::jit_memory::compile_component(&engine, &comp_bytes) {
             Ok(c) => c,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1826,7 +1839,7 @@ pub unsafe extern "C" fn hwr_p3s_start_http_precompiled(
             None => return std::ptr::null_mut(),
         };
         let component =
-            match unsafe { wasmtime::component::Component::deserialize(&engine, &comp_bytes) } {
+            match unsafe { crate::jit_memory::deserialize_component(&engine, &comp_bytes) } {
                 Ok(c) => c,
                 Err(_) => return std::ptr::null_mut(),
             };
@@ -1862,7 +1875,7 @@ pub unsafe extern "C" fn hwr_p3s_start_inference(
             Some(e) => e,
             None => return std::ptr::null_mut(),
         };
-        let component = match wasmtime::component::Component::new(&engine, &comp_bytes) {
+        let component = match crate::jit_memory::compile_component(&engine, &comp_bytes) {
             Ok(c) => c,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1896,7 +1909,7 @@ pub unsafe extern "C" fn hwr_p3s_start_inference_precompiled(
             None => return std::ptr::null_mut(),
         };
         let component =
-            match unsafe { wasmtime::component::Component::deserialize(&engine, &comp_bytes) } {
+            match unsafe { crate::jit_memory::deserialize_component(&engine, &comp_bytes) } {
                 Ok(c) => c,
                 Err(_) => return std::ptr::null_mut(),
             };
@@ -2082,7 +2095,7 @@ mod tests {
     fn p3_roundtrip(use_pulley: bool) {
         let bytes = include_bytes!("../tests/fixtures/p3_probe_guest.wasm");
         let engine = p3_engine(use_pulley).unwrap();
-        let component = wasmtime::component::Component::new(&engine, bytes.as_slice()).unwrap();
+        let component = crate::jit_memory::compile_component(&engine, bytes.as_slice()).unwrap();
         let mut s = p3_run_session(engine, component, b"ping".to_vec());
 
         assert_eq!(s.poll(), HWR_P3_PENDING);
@@ -2111,7 +2124,7 @@ mod tests {
     fn p3_free_while_pending() {
         let bytes = include_bytes!("../tests/fixtures/p3_probe_guest.wasm");
         let engine = p3_engine(false).unwrap();
-        let component = wasmtime::component::Component::new(&engine, bytes.as_slice()).unwrap();
+        let component = crate::jit_memory::compile_component(&engine, bytes.as_slice()).unwrap();
         let mut s = p3_run_session(engine, component, b"x".to_vec());
         assert_eq!(s.poll(), HWR_P3_PENDING);
         drop(s); // must not hang — Drop cancels the oneshot and joins the worker

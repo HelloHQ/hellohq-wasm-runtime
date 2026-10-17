@@ -672,6 +672,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "hyper",
+ "libc",
  "pollster",
  "serde_json",
  "wasmtime",

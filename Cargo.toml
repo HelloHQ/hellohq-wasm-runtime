@@ -83,6 +83,12 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # with the other typed-host modules being out of the base build.
 serde_json = { version = "1", optional = true }
 
+# macOS: the MAP_JIT code memory the hardened runtime requires (src/jit_memory.rs)
+# — mmap(MAP_JIT), pthread_jit_write_protect_np. Already in the lock file via
+# wasmtime, so this adds no new crate.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [features]
 # Desktop / Android / CI: in-process Cranelift compilation + `wat` parsing +
 # the async block_on executor. iOS builds with `--no-default-features` → runtime
@@ -138,6 +144,13 @@ required-features = ["compile"]
 [[example]]
 name = "bench_ios"
 required-features = ["ios-bench"]
+
+# macOS hardened-runtime proof: runs Cranelift code + the real hello-world plugin
+# through the C ABI; scripts/macos-hardened-runtime-check.sh codesigns it with
+# only `com.apple.security.cs.allow-jit` (the app's JIT entitlement).
+[[example]]
+name = "hardened_runtime_check"
+required-features = ["compile", "typed-hosts"]
 
 [profile.release]
 opt-level = "z"

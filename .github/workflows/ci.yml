@@ -64,6 +64,14 @@ jobs:
       - name: No-JIT build + tests (--no-default-features --features "wasi-http typed-hosts")
         run: cargo test --no-default-features --features "wasi-http typed-hosts" --lib --tests --locked
 
+      # The macOS app runs under the hardened runtime with only the allow-jit
+      # entitlement, which executes nothing but MAP_JIT memory. This codesigns a
+      # test binary that way (ad-hoc) and runs real Cranelift code + the
+      # hello-world plugin in it; stock Wasmtime code memory is killed there.
+      - name: macOS hardened-runtime check (allow-jit only)
+        if: runner.os == 'macOS'
+        run: scripts/macos-hardened-runtime-check.sh
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest

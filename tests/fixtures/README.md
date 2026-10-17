@@ -514,3 +514,24 @@ cp ../plugin-sdk/examples/component-quickstart-go/component_quickstart_go.compon
 ```
 
 `scripts/regen_probe_guest.sh` regenerates all fixtures (incl. this one).
+
+## `hello_world_plugin.component.wasm`
+
+The released hello-world SDK plugin, byte-for-byte: `plugin.wasm` from the
+HelloHQ/plugin-sdk release `hello-world-v1.0.1` (sha256
+`eaf371ccba5fa6203464b7d2f663a95bc7d94e5d7af6b51a191f6ec8ac8c39ff`, checked by
+`scripts/macos-hardened-runtime-check.sh`). It imports
+`hellohq:plugin/{types,workspace,log}@0.1.0` and exports
+`hellohq:plugin/guest@0.1.0`; on `run` it reads the portfolio names and returns a
+declarative UI document. Used by `examples/hardened_runtime_check.rs`, which runs
+it under the macOS hardened runtime.
+
+### Refresh
+
+Not built here — copy a release asset instead, and update the sha256 in the
+script:
+
+```sh
+curl -fsSL -o tests/fixtures/hello_world_plugin.component.wasm \
+  https://github.com/HelloHQ/plugin-sdk/releases/download/hello-world-v1.0.1/plugin.wasm
+```

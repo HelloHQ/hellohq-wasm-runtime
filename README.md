@@ -89,6 +89,7 @@ src/fetch_gate.rs         origin/SSRF gate for that path
 src/request_policy.rs     header policy for that path (port of the app's)
 include/                  the C header
 wit/, wit-wasi*/          the hellohq world and the vendored WASI packages
+src/jit_memory.rs         MAP_JIT code memory for the macOS hardened runtime
 tests/                    C-ABI and guest integration tests (fixtures in tests/fixtures)
 ```
 
@@ -99,6 +100,21 @@ cargo build                                        # host (Cranelift JIT)
 cargo test --all-targets                           # ABI + runtime tests
 cargo test --features "wasi-http typed-hosts" --all-targets
 cargo test --features "wasi-guests typed-hosts" --all-targets
+```
+
+## macOS hardened runtime
+
+The macOS app runs under the hardened runtime with the
+`com.apple.security.cs.allow-jit` entitlement, which only lets a process
+execute code from `MAP_JIT` memory. On macOS the runtime therefore loads all
+native (Cranelift) code into `MAP_JIT` mappings (`src/jit_memory.rs`); the app
+needs no `allow-unsigned-executable-memory`. Every engine builder must call
+`jit_memory::configure` and load code through `jit_memory::compile_*` /
+`deserialize_*`, never `Component::new` / `Component::deserialize` directly: code
+loaded the stock way is killed under the hardened runtime. Check it on a Mac:
+
+```bash
+scripts/macos-hardened-runtime-check.sh    # codesigns a test binary with only allow-jit
 ```
 
 `.github/workflows/ci.yml` lists every feature combination CI runs, including
