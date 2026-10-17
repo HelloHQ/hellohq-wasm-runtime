@@ -45,7 +45,7 @@ if [[ "$actual" != "$FIXTURE_SHA256" ]]; then
   exit 1
 fi
 
-cargo build --example hardened_runtime_check --features typed-hosts --locked "${PROFILE_FLAG[@]}"
+cargo build --example hardened_runtime_check --features typed-hosts --locked ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"}
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="$TARGET_DIR/$PROFILE_DIR/examples/hardened_runtime_check"
 
