@@ -157,3 +157,31 @@ fn pulley_real_plugin_over_p3() {
     assert_granted(true);
     assert_denied(true);
 }
+
+/// Free a plugin session WITHOUT ever polling: the plugin's first typed call sits
+/// buffered in the channel with its responder, and `hwr_p3_free` must still
+/// return (cancelling it) instead of joining a worker that waits forever.
+#[test]
+fn free_never_polled_does_not_hang() {
+    let session = unsafe {
+        hwr_p3_start_plugin_compile(
+            0,
+            PLUGIN_WASM.as_ptr(),
+            PLUGIN_WASM.len(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    assert!(!session.is_null());
+    // Give the worker time to reach its first host call so the event is buffered.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let addr = session as usize;
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        unsafe { hwr_p3_free(addr as *mut _) };
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("hwr_p3_free hung on a never-polled host call");
+}

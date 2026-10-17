@@ -1007,9 +1007,16 @@ impl HwrP3Session {
 impl Drop for HwrP3Session {
     fn drop(&mut self) {
         // Cancel any in-flight host call so the worker's await errors out and the
-        // run unwinds, then join. Dropping `rx` also drops buffered events
-        // (cancelling their responders) so a never-polled call can't wedge join.
+        // run unwinds, then join. A never-polled host call's responder is still
+        // buffered in `rx`, and fields drop only after this fn returns (after the
+        // join), so disconnect the receiver NOW: that discards buffered events
+        // (cancelling their responders) and makes any later send fail, dropping
+        // its responder too.
         self.pending_respond.take();
+        drop(std::mem::replace(
+            &mut self.rx,
+            std::sync::mpsc::channel().1,
+        ));
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -1590,9 +1597,14 @@ impl Drop for HwrP3Stream {
     fn drop(&mut self) {
         // Close inbound so the driver's await unblocks and the run unwinds.
         self.in_tx.take();
-        // Drain any buffered outbound events so the worker's sync sends don't
-        // wedge, then join.
-        while self.rx.try_recv().is_ok() {}
+        // Disconnect the receiver before joining, as HwrP3Session does: buffered
+        // outbound events are discarded and later sends fail fast. (Outbound
+        // events carry no responders and the channel is unbounded, so nothing
+        // can wedge here today; this keeps it so if one ever does.)
+        drop(std::mem::replace(
+            &mut self.rx,
+            std::sync::mpsc::channel().1,
+        ));
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -2128,6 +2140,30 @@ mod tests {
         let mut s = p3_run_session(engine, component, b"x".to_vec());
         assert_eq!(s.poll(), HWR_P3_PENDING);
         drop(s); // must not hang — Drop cancels the oneshot and joins the worker
+    }
+
+    // Free WITHOUT ever polling: the guest's host call sits buffered in the
+    // channel (its responder inside the queued event, not in `pending_respond`),
+    // so Drop must discard the queue before joining or the worker waits forever.
+    // Freed on a side thread with a deadline so a regression fails, not hangs.
+    #[cfg(feature = "compile")]
+    #[test]
+    fn p3_free_never_polled() {
+        let bytes = include_bytes!("../tests/fixtures/p3_probe_guest.wasm");
+        let session =
+            unsafe { hwr_p3_start_compile(0, bytes.as_ptr(), bytes.len(), b"x".as_ptr(), 1) };
+        assert!(!session.is_null());
+        // Give the worker time to reach the host call so the event is buffered.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let addr = session as usize;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            unsafe { hwr_p3_free(addr as *mut HwrP3Session) };
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("hwr_p3_free hung on a never-polled host call");
     }
 
     // P3 v2 streaming transport (stage 2). Synthetic driver: emit two outbound
