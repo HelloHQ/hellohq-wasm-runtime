@@ -3,7 +3,7 @@ name: CI
 # Test + lint gate on every push to main and every PR. Complements release.yml
 # (which only builds + publishes the native libs on a tag). Runs the unit tests
 # (src/lib.rs) and the C-ABI integration tests (tests/c_abi.rs) on all three
-# desktop OSes, plus a no-default-features pass that proves the iOS no-JIT
+# desktop OSes (macOS on both Apple Silicon and Intel), plus a no-default-features pass that proves the iOS no-JIT
 # (Pulley-only, no Cranelift) build links and its ungated tests pass.
 #
 # The build-ios / build-android jobs are compile-only cross-build checks (no
@@ -27,7 +27,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macos-15-intel: the shipped macOS x64 library runs JIT code from
+        # MAP_JIT memory with no per-thread write toggle (src/jit_memory.rs),
+        # a different path from Apple Silicon. This leg runs the whole suite
+        # and the hardened-runtime check on real x86_64 hardware (#28).
+        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
