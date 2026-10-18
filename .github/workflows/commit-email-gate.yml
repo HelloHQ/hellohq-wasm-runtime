@@ -33,10 +33,22 @@ jobs:
     # repo ever adopts pull requests — that is the only way this becomes
     # genuinely blocking without an Enterprise upgrade.
     name: Committer identity
+    # Private repos run on the self-hosted Linux pool: GitHub refuses to start
+    # hosted jobs on this account (payment/spending limit, since 2026-10-17), so
+    # a hosted job fails in a second and checks nothing. PUBLIC repos stay on
+    # GitHub-hosted runners (free there), because a self-hosted runner on a
+    # public repo would run strangers' pull requests on our machines.
+    # scripts/rollout_commit_email_gate.sh writes the right label per repo from
+    # mani.yaml's private/public tag; the line below is the private form.
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
         with:
+          # pull_request defaults to GitHub's synthetic merge commit, whose
+          # identity is not controlled by the branch author. Inspect the
+          # submitted branch tip so only real repository commits are gated.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           # Full history: the range this job checks can start at any commit
           # already on the remote, and a shallow clone would not contain it.
           fetch-depth: 0
@@ -73,7 +85,16 @@ jobs:
           # matters, so every branch of this resolves to a real range or falls
           # back to checking the tip.
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            git fetch --quiet origin "$BASE_REF"
+            # Explicit refspec. actions/checkout narrows remote.origin.fetch
+            # to the ref it checked out (for a PR, the pull ref), so a bare
+            # `git fetch origin "$BASE_REF"` updates FETCH_HEAD and creates NO
+            # refs/remotes/origin/$BASE_REF. `origin/$BASE_REF..HEAD` then
+            # fails to resolve, the range check below falls through to the
+            # tip-only fallback, and on a pull_request the tip is GitHub's own
+            # merge commit — authored noreply@github.com, which ALLOWED
+            # permits. The gate would pass a PR whose every real commit came
+            # from a non-hellohq address, reporting "Checked 1 commit(s)."
+            git fetch --quiet origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
             RANGE="origin/${BASE_REF}..HEAD"
           elif [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "$ZERO" ] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
             RANGE="${BEFORE}..HEAD"
