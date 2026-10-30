@@ -15,13 +15,15 @@ name = "hellohq_wasm_runtime"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
-# Pinned via `cargo add` (exact published version in Cargo.lock). Wasmtime 46
-# lands WASI 0.3 + Component Model Async by default; its MSRV is 1.94.0, which
-# is exactly the toolchain `rust-toolchain.toml` pins (see the iOS note there).
+# Pinned via `cargo add` (exact published version in Cargo.lock). 48.0.7 is the
+# floor: it carries the fix for GHSA-mghf-wjfp-p5xm (Cranelift aarch64 could
+# jump to the wrong target on a large `br_table`; all of 37.0.0..<48.0.7 is
+# affected). Wasmtime 48's MSRV is 1.95.0, which is exactly the toolchain
+# `rust-toolchain.toml` pins (see the iOS staticlib note there).
 # We disable default features and opt in explicitly so
 # the iOS build can drop Cranelift (the JIT compiler) and ship only the runtime
 # + Pulley interpreter — the no-JIT payload the < 8 MB Spike-1 budget measures.
-wasmtime = { version = "46.0.3", default-features = false, features = [
+wasmtime = { version = "48.0.7", default-features = false, features = [
   "std",
   "runtime",
   "pulley",
@@ -36,18 +38,18 @@ wasmtime = { version = "46.0.3", default-features = false, features = [
 # entrypoint — the "block on a blockable worker isolate" bridge (docs 51/52).
 # Base (non-optional) because the P3 host-call round-trip must work on the iOS
 # no-JIT build too, not only `compile` builds.
-# WASI 0.2 host implementation, version-matched to `wasmtime` (46). Provides the
+# WASI 0.2 host implementation, version-matched to `wasmtime` (48). Provides the
 # `wasi:*@0.2.x` interfaces JS (jco) and Go (TinyGo) SDK components import — Rust
 # no-std guests import only `hellohq:plugin/*`, but those richer guests embed a
 # language runtime that ALSO imports the wasi:0.2 surface, so the host must
 # satisfy it (locked-down) or instantiation fails. OPTIONAL + behind the
 # `wasi-guests` feature: it pulls heavy deps (tokio, cap-std, …) and is Cranelift-
 # adjacent, so default / `--no-default-features` (the iOS no-JIT size budget)
-# stay unaffected. Pinned to 46 so its WASI 0.2 interfaces match wasmtime 46's
+# stay unaffected. Pinned to 48 so its WASI 0.2 interfaces match wasmtime 48's
 # component-model ABI (a version mismatch fails to compile / links the wrong
 # wasi version).
-wasmtime-wasi = { version = "46", optional = true }
-# WASI 0.2 `wasi:http` host, version-matched to `wasmtime` (46). JS (jco)
+wasmtime-wasi = { version = "48.0.7", optional = true }
+# WASI 0.2 `wasi:http` host, version-matched to `wasmtime` (48). JS (jco)
 # components import `wasi:http@0.2` as part of the engine baseline even when
 # unused, so the interface must be PRESENT to instantiate. We register it behind
 # a GATE (`GatedHttpHooks` in `src/wasi_guests.rs` + `src/fetch_gate.rs`): every
@@ -56,19 +58,25 @@ wasmtime-wasi = { version = "46", optional = true }
 # all (the safe default). Same heavy-deps / feature-gating story as
 # `wasmtime-wasi` (tokio, hyper, cap-std), so it rides the `wasi-guests`
 # feature only — default / `--no-default-features` (iOS no-JIT) stay unaffected.
-wasmtime-wasi-http = { version = "46", optional = true }
+wasmtime-wasi-http = { version = "48.0.7", optional = true }
 # Only used to name the `hyper::Request` type in the gated
 # `GatedHttpHooks::send_request` signature (the request body type comes from
-# `wasmtime-wasi-http`). Version-matched to what `wasmtime-wasi-http@46` pulls in
+# `wasmtime-wasi-http`). Version-matched to what `wasmtime-wasi-http@48` pulls in
 # (hyper 1.x). Optional + in `wasi-guests` only — it's already a transitive dep
 # of `wasmtime-wasi-http`, so this adds no new code to default/iOS builds.
 hyper = { version = "1", optional = true }
 # Used ONLY by the `wasi:http@0.2` gate unit tests, to build an empty
 # `HyperOutgoingBody` to hand `GatedHttpHooks::send_request`. Both are already
-# transitive deps of `wasmtime-wasi-http@46`; optional + in `wasi-guests` only,
+# transitive deps of `wasmtime-wasi-http@48`; optional + in `wasi-guests` only,
 # so default / `--no-default-features` (iOS no-JIT) stay unaffected.
 http-body-util = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
+# Used ONLY to name `InvalidDnsNameError` in the gated hooks'
+# `p2_error_from_dns` override (blanks the free-form rcode the library default
+# attaches). Already a transitive dep of `wasmtime-wasi-http@48` (via rustls);
+# optional + in the wasi-guests features only, so default / iOS no-JIT builds
+# are unaffected.
+rustls-pki-types = { version = "1", optional = true, default-features = false }
 pollster = "1.0.1"
 # Oneshot + mpsc channels for the P3 round-trip: the host import awaits a value
 # the caller (Dart) supplies via `hwr_p3_resolve`/streaming push from another
@@ -114,14 +122,14 @@ wasi-http = []
 # compiles a component via Cranelift). OUT of default + `--no-default-features`
 # so the iOS no-JIT size is unaffected — the iOS size / cross-compile of
 # wasmtime-wasi is a deliberate follow-on, not solved here.
-wasi-guests = ["wasi-http", "compile", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http", "dep:hyper", "dep:http-body-util", "dep:bytes"]
+wasi-guests = ["wasi-http", "compile", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http", "dep:hyper", "dep:http-body-util", "dep:bytes", "dep:rustls-pki-types"]
 # Size-measurement ONLY: the `wasi-guests` host surface (wasmtime-wasi +
 # wasmtime-wasi-http + the wasi_guests/fetch_gate modules) WITHOUT `compile`
 # (Cranelift/wat). Lets the iOS no-JIT (Pulley) build link the WASI host so we
 # can measure what wasmtime-wasi alone adds, isolated from the JIT. NOT for
 # running guests (instantiating a portable component needs `compile`); the
 # guest tests stay on `wasi-guests`. Out of default — purely a measurement knob.
-wasi-guests-measure = ["wasi-http", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http", "dep:hyper", "dep:http-body-util", "dep:bytes"]
+wasi-guests-measure = ["wasi-http", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http", "dep:hyper", "dep:http-body-util", "dep:bytes", "dep:rustls-pki-types"]
 # C1 (typed Component-Model host imports in production): the transport-backed
 # capability hosts (`src/plugin_host.rs`) that forward each typed import over the
 # P3 round-trip to the app, bridging to/from the existing JSON host-call wire.
@@ -159,10 +167,11 @@ strip = true
 # panic = unwind (default) so the FFI entrypoints' catch_unwind converts any
 # panic into an error return instead of unwinding across the C boundary.
 #
-# NOTE: the Rust toolchain is pinned in rust-toolchain.toml. rustc 1.96.0
-# regressed fat-LTO symbol export for `staticlib` crates: the #[no_mangle]
-# `hwr_*` FFI exports get internalized and dead-stripped, so the iOS xcframework
-# (the only staticlib consumer) ships with zero callable symbols. cdylibs
-# (macOS/Linux/Windows/Android) are unaffected — they carry an explicit export
-# list. The pin keeps us on a toolchain that retains the exports; do NOT bump it
-# without re-verifying `nm` shows hwr_* in the iOS .a (see tests + CI).
+# NOTE: the Rust toolchain is pinned in rust-toolchain.toml. Since rustc 1.95,
+# fat LTO internalizes and dead-strips the #[no_mangle] `hwr_*` FFI exports of
+# the `staticlib` when it is built together with the cdylib + rlib above, so the
+# iOS xcframework (the only staticlib consumer) would ship with zero callable
+# symbols. cdylibs (macOS/Linux/Windows/Android) are unaffected — they carry an
+# explicit export list. scripts/build-release.sh therefore builds the iOS slices
+# with `cargo rustc --crate-type staticlib` (which keeps the exports) and checks
+# `nm` for the hwr_* symbols; do NOT bump the pin without re-verifying that.

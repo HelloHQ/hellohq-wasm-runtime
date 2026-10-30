@@ -79,8 +79,33 @@ build_nojit() {
   # (hwr_p3s_start_{http,inference}_precompiled); typed-hosts adds the C1 typed
   # capability entrypoints (hwr_p3_start_{workspace,storage_events,plugin}), all
   # of which run from precompiled pulley64 artifacts on the iOS no-JIT slice.
-  echo "→ cargo build --release --no-default-features --features \"wasi-http typed-hosts\" --target $1  (Pulley, no JIT)"
-  cargo build --release --no-default-features --features "wasi-http typed-hosts" --target "$1"
+  #
+  # `cargo rustc --crate-type staticlib`, NOT `cargo build`: built alongside the
+  # manifest's cdylib + rlib under fat LTO, rustc >= 1.95 internalizes and drops
+  # every #[no_mangle] hwr_* export from the staticlib (0 exports; see
+  # rust-toolchain.toml). Built as the only crate type it keeps all of them.
+  echo "→ cargo rustc --release --lib --crate-type staticlib --no-default-features --features \"wasi-http typed-hosts\" --target $1  (Pulley, no JIT)"
+  cargo rustc --release --lib --crate-type staticlib --no-default-features --features "wasi-http typed-hosts" --target "$1"
+  check_staticlib_exports "target/$1/release/$STATICLIB"
+}
+
+# Fail the build if a staticlib lost its C ABI (the toolchain regression above):
+# the symbols the app's iOS loader and the precompiled entrypoints need must be
+# exported.
+check_staticlib_exports() {
+  local lib="$1" sym missing=0 syms
+  # Captured once, not piped into `grep -q` (an early exit would SIGPIPE nm and
+  # trip pipefail).
+  syms="$(nm -gU "$lib" 2>/dev/null || true)"
+  for sym in hwr_abi_version hwr_self_test hwr_instance_new_precompiled \
+             hwr_p3s_start_http_precompiled hwr_p3s_start_inference_precompiled \
+             hwr_p3_start_workspace; do
+    if ! grep -q " _${sym}\$" <<<"$syms"; then
+      echo "✗ $lib does not export $sym" >&2; missing=1
+    fi
+  done
+  [ "$missing" -eq 0 ] || exit 1
+  echo "  $(grep -c ' _hwr_' <<<"$syms") hwr_* exports in $lib"
 }
 
 # ---------------------------------------------------------------------------

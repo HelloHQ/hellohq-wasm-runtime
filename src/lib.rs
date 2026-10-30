@@ -405,7 +405,7 @@ const CANON_ASYNC_WAT: &str = r#"(component
   (core instance $i (instantiate $m
     (with "" (instance (export "task-return" (func $task_return))))))
   (func (export "run") async (param "x" u32) (result u32)
-    (canon lift (core func $i "run") async (callback (func $i "cb")))))"#;
+    (canon lift (core func $i "run") async (callback (core func $i "cb")))))"#;
 
 /// Instantiates [CANON_ASYNC_WAT] and drives the **async-lifted** export with
 /// `call_async` (`wasm_component_model_async(true)`). Proves the canonical async
@@ -415,7 +415,8 @@ const CANON_ASYNC_WAT: &str = r#"(component
 /// NOTE: the component-level func type is declared `async` (`(func … async …)`).
 /// Wasmtime 46's validator (wasmparser 0.251) requires the `async` canonical
 /// lift option to sit on an async-typed component function; on 45 the plain
-/// (sync) type was still accepted.
+/// (sync) type was still accepted. Since Wasmtime 48 (wat 1.263) the
+/// `callback` option must also name a core function as `(core func …)`.
 #[cfg(feature = "compile")]
 async fn run_canonical_async_double(use_pulley: bool, x: u32) -> wasmtime::Result<u32> {
     use wasmtime::component::Linker;

@@ -13,7 +13,7 @@
 //! `SIGKILL (Code Signature Invalid)`. The only entitlement that would allow it
 //! is `allow-unsigned-executable-memory`, which the app does not carry.
 //!
-//! Wasmtime 46 has no `MAP_JIT` support of its own, and its
+//! Wasmtime (46 through 48) has no `MAP_JIT` support of its own, and its
 //! `wasmtime::CustomCodeMemory` hook only changes page permissions; it cannot choose
 //! where code lives. `MAP_JIT` cannot be applied to an existing mapping either:
 //! `mmap(MAP_JIT | MAP_FIXED)` returns `EINVAL`.
