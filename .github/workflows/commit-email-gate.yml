@@ -21,7 +21,10 @@ name: commit-email-gate
 # here is silently reverted by the next rollout.
 
 on:
+  # Dependabot's branches run on pull_request only, so a bot PR is not checked twice.
   push:
+    branches-ignore: ['dependabot/**']
+    tags: ['**']
   pull_request:
 
 permissions:
@@ -43,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # pull_request defaults to GitHub's synthetic merge commit, whose
           # identity is not controlled by the branch author. Inspect the
