@@ -178,22 +178,58 @@ fn decode_currency_rates(data: &Value) -> Vec<CurrencyRate> {
         .unwrap_or_default()
 }
 
-fn decode_aggregated_summary(data: &Value) -> AggregatedSummary {
+/// Decodes the app's `read:aggregated_values` reply into the WIT summary for
+/// [requested].
+///
+/// The app answers `{portfolios: [{id, totals: [{currency_id, total, assets,
+/// debts, assets_as_of, debts_as_of}]}]}`: one entry per portfolio, one total
+/// per currency (`assets`/`debts` are exact decimal strings, `total` their sum
+/// as f64). The WIT record has `category` and `total`, so each currency becomes
+/// a category. The older flat shape `{portfolio_id, totals: [{category,
+/// total}]}` is still read, so a reply in either shape decodes.
+fn decode_aggregated_summary(data: &Value, requested: &str) -> AggregatedSummary {
+    let (portfolio, portfolio_id) = match data.get("portfolios").and_then(Value::as_array) {
+        Some(list) => match list
+            .iter()
+            .find(|p| p.get("id").and_then(Value::as_str) == Some(requested))
+            .or_else(|| list.first())
+        {
+            Some(p) => (p, s(p, "id")),
+            None => {
+                return AggregatedSummary {
+                    portfolio_id: requested.to_string(),
+                    totals: Vec::new(),
+                }
+            }
+        },
+        None => (data, s(data, "portfolio_id")),
+    };
     AggregatedSummary {
-        portfolio_id: s(data, "portfolio_id"),
-        totals: data
+        portfolio_id,
+        totals: portfolio
             .get("totals")
             .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .map(|t| CategoryTotal {
-                        category: s(t, "category"),
-                        total: t.get("total").and_then(Value::as_f64).unwrap_or(0.0),
-                    })
-                    .collect()
-            })
+            .map(|arr| arr.iter().map(decode_category_total).collect())
             .unwrap_or_default(),
     }
+}
+
+fn decode_category_total(t: &Value) -> CategoryTotal {
+    let category = match t.get("currency_id").and_then(Value::as_str) {
+        Some(id) => id.to_string(),
+        None => s(t, "category"),
+    };
+    // `total` when present; otherwise the exact `assets` + `debts` strings.
+    let total = t.get("total").and_then(Value::as_f64).unwrap_or_else(|| {
+        let part = |key: &str| {
+            t.get(key)
+                .and_then(Value::as_str)
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        part("assets") + part("debts")
+    });
+    CategoryTotal { category, total }
 }
 
 fn transport_gone() -> ApiError {
@@ -229,7 +265,7 @@ impl hellohq::plugin::workspace::Host for TransportWorkspaceHost {
         portfolio_id: String,
     ) -> Result<AggregatedSummary, ApiError> {
         self.forward("read:aggregated_values", Some(&portfolio_id))
-            .map(|d| decode_aggregated_summary(&d))
+            .map(|d| decode_aggregated_summary(&d, &portfolio_id))
     }
 
     fn write_external_file(
@@ -334,17 +370,65 @@ mod tests {
         assert!((got[0].rate - 1.08).abs() < f64::EPSILON);
     }
 
+    /// The reply the app actually sends (hellohq `readAggregatedValues`):
+    /// per-portfolio entries with per-currency totals and exact decimal strings.
     #[test]
-    fn decodes_aggregated_summary() {
+    fn decodes_the_apps_aggregated_values_reply() {
+        let data = json!({"portfolios": [
+            {"id": "pf-1", "totals": [
+                {"currency_id": "USD", "total": 45000.5, "assets": "50000.50",
+                 "debts": "-5000.00", "assets_as_of": "2026-10-31", "debts_as_of": "2026-10-30"},
+                {"currency_id": "SGD", "total": 1200.0, "assets": "1200",
+                 "debts": "0", "assets_as_of": "2026-10-31", "debts_as_of": null}
+            ]}
+        ]});
+        let got = decode_aggregated_summary(&data, "pf-1");
+        assert_eq!(got.portfolio_id, "pf-1");
+        assert_eq!(got.totals.len(), 2);
+        assert_eq!(got.totals[0].category, "USD");
+        assert!((got.totals[0].total - 45000.5).abs() < f64::EPSILON);
+        assert_eq!(got.totals[1].category, "SGD");
+        assert!((got.totals[1].total - 1200.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn picks_the_requested_portfolio_from_several() {
+        let data = json!({"portfolios": [
+            {"id": "pf-a", "totals": [{"currency_id": "USD", "total": 1.0}]},
+            {"id": "pf-b", "totals": [{"currency_id": "EUR", "total": 2.0}]}
+        ]});
+        let got = decode_aggregated_summary(&data, "pf-b");
+        assert_eq!(got.portfolio_id, "pf-b");
+        assert_eq!(got.totals[0].category, "EUR");
+    }
+
+    #[test]
+    fn falls_back_to_assets_plus_debts_without_a_total() {
+        let data = json!({"portfolios": [{"id": "pf-1", "totals": [
+            {"currency_id": "USD", "assets": "100.25", "debts": "-40"}
+        ]}]});
+        let got = decode_aggregated_summary(&data, "pf-1");
+        assert!((got.totals[0].total - 60.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn still_reads_the_old_flat_shape() {
         let data = json!({
             "portfolio_id": "pf-1",
             "totals": [{"category": "equities", "total": 45000.5}],
         });
-        let got = decode_aggregated_summary(&data);
+        let got = decode_aggregated_summary(&data, "pf-1");
         assert_eq!(got.portfolio_id, "pf-1");
         assert_eq!(got.totals.len(), 1);
         assert_eq!(got.totals[0].category, "equities");
         assert!((got.totals[0].total - 45000.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn an_empty_portfolio_list_is_an_empty_summary() {
+        let got = decode_aggregated_summary(&json!({"portfolios": []}), "pf-1");
+        assert_eq!(got.portfolio_id, "pf-1");
+        assert!(got.totals.is_empty());
     }
 
     #[test]
