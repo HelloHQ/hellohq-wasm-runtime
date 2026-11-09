@@ -49,13 +49,23 @@
 //!
 //! ## Lifetime
 //!
-//! A mapping is unmapped when its engine's `MapJitCodeMemory` is dropped. Every
-//! piece of Wasmtime code memory holds an `Arc` to the engine's hook, so that
-//! drop happens only after the last component, module, store and engine
-//! clone using the code is gone. (It happens after Wasmtime has also
-//! unregistered the code's unwind tables.) The cost is that a long-lived engine
-//! keeps the code of every component it loaded until the engine is freed. The
-//! per-run P3 engines the app uses are freed at the end of each run.
+//! A mapping must outlive every use of its code. Wasmtime drops a piece of code
+//! memory (`CodeMemory::drop`) once the last component, module, instance and
+//! store using it is gone, and in that drop it first calls the hook's
+//! `unpublish_executable`, *then* deregisters the code's unwind tables, which
+//! live in the same mapping. So the hook cannot unmap inside
+//! `unpublish_executable`: another thread could map new code at the same
+//! address while the old unwind entries are still registered.
+//!
+//! Instead `unpublish_executable` **retires** the mapping, tagged with the
+//! calling thread. A retired mapping is unmapped the next time that same thread
+//! enters the hook (publish or unpublish): a thread runs one drop at a time, so
+//! by then the drop that retired it, unwind deregistration included, has
+//! finished. Whatever is still retired or owned is unmapped when the hook itself
+//! drops, after every piece of code memory holding an `Arc` to it is gone. A
+//! long-lived engine that loads and drops code repeatedly therefore keeps at
+//! most one retired mapping per thread, not one per load (#29). The per-run P3
+//! engines the app uses are freed at the end of each run anyway.
 //!
 //! ## Everything else
 //!
@@ -88,6 +98,21 @@ pub fn publish_counts() -> (usize, usize) {
     #[cfg(not(target_os = "macos"))]
     {
         (0, 0)
+    }
+}
+
+/// `MAP_JIT` code mappings currently mapped in this process. Diagnostics and
+/// tests only (#29): a long-lived engine that loads and drops code must keep
+/// this bounded. Always 0 off macOS.
+#[doc(hidden)]
+pub fn live_code_regions() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        macos::stats::LIVE_REGIONS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        0
     }
 }
 
@@ -220,6 +245,7 @@ mod macos {
                 base: ptr as usize,
                 len,
             };
+            stats::LIVE_REGIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             {
                 let _write = JitWriteWindow::open();
                 // SAFETY: `ptr` is a fresh private mapping of at least
@@ -242,6 +268,7 @@ mod macos {
             // SAFETY: we own this mapping and nothing references it any more
             // (see the lifetime notes on the module).
             unsafe { libc::munmap(self.base as *mut libc::c_void, self.len) };
+            stats::LIVE_REGIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -281,20 +308,38 @@ mod macos {
     }
 
     /// The engine's code-memory hook: claims `MAP_JIT` mappings when Wasmtime
-    /// publishes code in them, and owns them until the engine is gone.
+    /// publishes code in them, retires them when the code is dropped, and frees
+    /// them once that is safe (module docs, "Lifetime").
     pub(super) struct MapJitCodeMemory {
         owned: Mutex<Vec<Region>>,
+        /// Unpublished mappings, each with the thread whose `CodeMemory::drop`
+        /// retired it. That drop may still be deregistering unwind tables.
+        retired: Mutex<Vec<(std::thread::ThreadId, Region)>>,
     }
 
     impl MapJitCodeMemory {
         pub(super) fn new() -> Self {
             MapJitCodeMemory {
                 owned: Mutex::new(Vec::new()),
+                retired: Mutex::new(Vec::new()),
             }
         }
 
-        fn owns(&self, ptr: usize, len: usize) -> bool {
-            lock(&self.owned).iter().any(|r| r.contains(ptr, len))
+        /// Unmap what this thread retired earlier. Called on entry to the hook:
+        /// the drop that retired it has finished, since a thread is in at most
+        /// one `CodeMemory::drop` at a time and deregistering unwind tables
+        /// does not call back into the hook.
+        fn free_retired_by_this_thread(&self) {
+            let me = std::thread::current().id();
+            let done: Vec<Region> = {
+                let mut retired = lock(&self.retired);
+                let (mine, others) = std::mem::take(&mut *retired)
+                    .into_iter()
+                    .partition(|(t, _)| *t == me);
+                *retired = others;
+                mine.into_iter().map(|(_, r)| r).collect()
+            };
+            drop(done); // munmap, outside the lock
         }
     }
 
@@ -306,6 +351,7 @@ mod macos {
         }
 
         fn publish_executable(&self, ptr: *const u8, len: usize) -> Result<()> {
+            self.free_retired_by_this_thread();
             let addr = ptr as usize;
             if let Some(region) = take_pending(|r| r.contains(addr, len)) {
                 // Already read+write+execute and flushed by `with_contents`.
@@ -334,9 +380,20 @@ mod macos {
         }
 
         fn unpublish_executable(&self, ptr: *const u8, len: usize) -> Result<()> {
-            if self.owns(ptr as usize, len) {
-                // Wasmtime calls this when the code is dropped. The mapping is
-                // freed with this hook (module docs), so nothing to do.
+            self.free_retired_by_this_thread();
+            let addr = ptr as usize;
+            let region = {
+                let mut owned = lock(&self.owned);
+                owned
+                    .iter()
+                    .position(|r| r.contains(addr, len))
+                    .map(|i| owned.swap_remove(i))
+            };
+            if let Some(region) = region {
+                // Wasmtime is dropping this code and will deregister its unwind
+                // tables next, still reading the mapping's addresses: retire it
+                // and free it on this thread's next call (module docs).
+                lock(&self.retired).push((std::thread::current().id(), region));
                 return Ok(());
             }
             // SAFETY: the inverse of the fallback in `publish_executable`.
@@ -453,6 +510,10 @@ mod macos {
         /// Process-wide totals, for diagnostics (`super::super::publish_counts`).
         /// The per-thread `COUNTS` above stay the tests' measure, so parallel
         /// tests do not see each other's loads.
+        /// `MAP_JIT` mappings currently mapped, process-wide.
+        pub(in super::super) static LIVE_REGIONS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+
         pub(in super::super) static MAP_JIT_TOTAL: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
         pub(in super::super) static FALLBACK_TOTAL: std::sync::atomic::AtomicUsize =
