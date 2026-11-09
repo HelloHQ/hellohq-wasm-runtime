@@ -119,6 +119,11 @@ pub mod request_policy;
 // messages. Plain Rust + Wasmtime only, so it is in every build.
 pub mod limits;
 
+// Wire format for `hellohq-wasm-host`, the helper that runs one plugin session
+// out of the app's process over stdin/stdout. Pure framing, no Wasmtime, so it
+// is in every build (the app side reimplements it; the tests pin both).
+pub mod host_protocol;
+
 // Executable code memory: on macOS every native (non-Pulley) engine's code lives
 // in MAP_JIT memory, the only kind the hardened runtime's allow-jit entitlement
 // lets us execute. Every engine builder calls `jit_memory::configure` and loads

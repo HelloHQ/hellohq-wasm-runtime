@@ -160,6 +160,13 @@ required-features = ["ios-bench"]
 name = "hardened_runtime_check"
 required-features = ["compile", "typed-hosts"]
 
+# The out-of-process helper: one plugin session per process over stdin/stdout
+# (src/host_protocol.rs). Needs the same features as the release libraries.
+[[bin]]
+name = "hellohq-wasm-host"
+path = "src/bin/hellohq-wasm-host.rs"
+required-features = ["compile", "typed-hosts", "wasi-http"]
+
 [profile.release]
 opt-level = "z"
 lto = true

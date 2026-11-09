@@ -18,10 +18,10 @@
 # dylibs share a filename but differ by arch, hence per-platform zips rather
 # than a flat copy). The app-side fetch script unzips the asset for the running
 # platform into third_party/wasm_runtime/<platformDir>/. Assets produced:
-#   dist/macos-arm64.zip   → macos-arm64/libhellohq_wasm_runtime.dylib
-#   dist/macos-x64.zip     → macos-x64/libhellohq_wasm_runtime.dylib
-#   dist/linux-x64.zip     → linux-x64/libhellohq_wasm_runtime.so
-#   dist/windows-x64.zip   → windows-x64/hellohq_wasm_runtime.dll
+#   dist/macos-arm64.zip   → macos-arm64/{libhellohq_wasm_runtime.dylib,hellohq-wasm-host}
+#   dist/macos-x64.zip     → macos-x64/{libhellohq_wasm_runtime.dylib,hellohq-wasm-host}
+#   dist/linux-x64.zip     → linux-x64/{libhellohq_wasm_runtime.so,hellohq-wasm-host}
+#   dist/windows-x64.zip   → windows-x64/{hellohq_wasm_runtime.dll,hellohq-wasm-host.exe}
 #   dist/jniLibs.zip       → jniLibs/{arm64-v8a,armeabi-v7a,x86_64}/libhellohq_wasm_runtime.so
 #   dist/HelloHQWasmRuntime.xcframework.zip
 # The <platformDir> names match hellohq's loader (wasm_runtime_loader.dart
@@ -41,6 +41,9 @@ rm -rf "$STAGE" && mkdir -p "$STAGE"
 DYLIB=libhellohq_wasm_runtime.dylib
 SO=libhellohq_wasm_runtime.so
 DLL=hellohq_wasm_runtime.dll
+# The out-of-process helper (src/bin/hellohq-wasm-host.rs), built by build_jit
+# alongside the library and shipped next to it in each desktop platform zip.
+HOST_BIN=hellohq-wasm-host
 STATICLIB=libhellohq_wasm_runtime.a
 
 # True if the given rustup target is installed (toolchain present for it).
@@ -190,6 +193,7 @@ case "$(uname -s)" in
         mkdir -p "$STAGE/$d"
         cp "target/$t/release/$DYLIB" "$STAGE/$d/$DYLIB"
         install_name_tool -id "@rpath/$DYLIB" "$STAGE/$d/$DYLIB"
+        cp "target/$t/release/$HOST_BIN" "$STAGE/$d/$HOST_BIN"
         # WASM_RUNTIME_NO_ZIP=1 leaves the dir unzipped (local inspection/test);
         # CI leaves it unset so each platform dir becomes a unique-named zip asset.
         [ -n "${WASM_RUNTIME_NO_ZIP:-}" ] || zip_platform_dir "$d"
@@ -206,6 +210,7 @@ case "$(uname -s)" in
       build_jit "$t"
       mkdir -p "$STAGE/linux-x64"
       cp "target/$t/release/$SO" "$STAGE/linux-x64/$SO"
+      cp "target/$t/release/$HOST_BIN" "$STAGE/linux-x64/$HOST_BIN"
       [ -n "${WASM_RUNTIME_NO_ZIP:-}" ] || zip_platform_dir linux-x64
     else
       echo "⚠ $t not installed; skipping linux-x64"
@@ -218,6 +223,7 @@ case "$(uname -s)" in
       build_jit "$t"
       mkdir -p "$STAGE/windows-x64"
       cp "target/$t/release/$DLL" "$STAGE/windows-x64/$DLL"
+      cp "target/$t/release/$HOST_BIN.exe" "$STAGE/windows-x64/$HOST_BIN.exe"
       [ -n "${WASM_RUNTIME_NO_ZIP:-}" ] || zip_platform_dir windows-x64
     else
       echo "⚠ $t not installed; skipping windows-x64"

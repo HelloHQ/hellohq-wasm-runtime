@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Embedded into the macOS helper binary (__TEXT,__info_plist) by build.rs.
+  macOS refuses to start a command-line tool under App Sandbox unless the tool
+  carries an Info.plist with a bundle identifier: without it the process traps
+  at launch (exit 133). The app that bundles the helper signs it with its own
+  identifier and entitlements; this identifier is the default.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.hellohq.hellohq.wasm-host</string>
+	<key>CFBundleName</key>
+	<string>hellohq-wasm-host</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+</dict>
+</plist>

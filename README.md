@@ -77,6 +77,32 @@ prefixed with `hellohq-plugin-cpu-limit:` or `hellohq-plugin-memory-limit:`.
 and the P3 run engines share the setting, so artifacts produced by this crate
 round-trip; artifacts precompiled by an older release must be regenerated.
 
+## Out-of-process helper
+
+`hellohq-wasm-host` (`src/bin/hellohq-wasm-host.rs`) runs **one** plugin
+session in its own process and relays the same events the C ABI produces, over
+length-prefixed frames on stdin/stdout (`src/host_protocol.rs`). Every frame maps
+onto one `hwr_p3_*` / `hwr_p3s_*` call, so a plugin sees no difference between
+the in-process library and the helper. Host calls still reach the app as
+PENDING frames, and wasi:http / ai:inference traffic as OUT frames, so the
+permission gate and the network policy stay in the app.
+
+Why an app would use it:
+
+- A Wasmtime escape lands in a small process holding no data, not in the app.
+- The app stops a run at any moment by ending the process, even mid-host-call.
+- Only the helper needs `com.apple.security.cs.allow-jit`; the app does not.
+- The helper needs no files and no network, so it can run under a much stricter
+  sandbox than the app. On macOS it starts under App Sandbox with `allow-jit` as
+  its only other entitlement. A command-line tool needs an embedded Info.plist
+  to start under App Sandbox; `build.rs` embeds
+  `src/bin/hellohq-wasm-host.Info.plist`. It must be signed with a team identity
+  (an ad-hoc signature traps at launch under App Sandbox).
+
+The helper exits after DONE or ERROR, exits with code 2 when its stdin closes
+(the app went away), and never outlives the app. `tests/host_process.rs` drives
+it as a child process. Release zips ship it next to the desktop library.
+
 ## Layout
 
 ```
@@ -90,6 +116,8 @@ src/request_policy.rs     header policy for that path (port of the app's)
 include/                  the C header
 wit/, wit-wasi*/          the hellohq world and the vendored WASI packages
 src/jit_memory.rs         MAP_JIT code memory for the macOS hardened runtime
+src/host_protocol.rs      frame format between an app and the helper
+src/bin/hellohq-wasm-host.rs  the out-of-process helper (one session per process)
 tests/                    C-ABI and guest integration tests (fixtures in tests/fixtures)
 ```
 
