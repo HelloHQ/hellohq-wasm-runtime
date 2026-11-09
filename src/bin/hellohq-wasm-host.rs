@@ -22,8 +22,8 @@ use hellohq_wasm_runtime::host_protocol::{
     FRAME_START,
 };
 use hellohq_wasm_runtime::{
-    hwr_abi_version, hwr_p3_free, hwr_p3_poll, hwr_p3_request_len, hwr_p3_request_ptr,
-    hwr_p3_resolve, hwr_p3_result_len, hwr_p3_result_ptr, hwr_p3_start_plugin,
+    hwr_abi_version, hwr_last_error, hwr_p3_free, hwr_p3_poll, hwr_p3_request_len,
+    hwr_p3_request_ptr, hwr_p3_resolve, hwr_p3_result_len, hwr_p3_result_ptr, hwr_p3_start_plugin,
     hwr_p3_start_plugin_compile, hwr_p3s_free, hwr_p3s_out_len, hwr_p3s_out_ptr, hwr_p3s_poll,
     hwr_p3s_push, hwr_p3s_push_end, hwr_p3s_result_len, hwr_p3s_result_ptr, hwr_p3s_start_http,
     hwr_p3s_start_inference, hwr_set_fuel_budget, HWR_P3S_DONE, HWR_P3S_ERROR, HWR_P3S_OUT,
@@ -86,6 +86,21 @@ fn next_frame(input: &mut impl Read) -> Result<(u8, Vec<u8>), Stop> {
     }
 }
 
+/// Why the start call just made on this thread failed: the runtime's
+/// `hwr_last_error` line (a stable prefix, no plugin text), so the app can tell
+/// a build without the JIT entitlement from a broken plugin (#30).
+fn start_failure() -> String {
+    let ptr = hwr_last_error();
+    if ptr.is_null() {
+        return "the plugin could not be started".to_string();
+    }
+    // SAFETY: a NUL-terminated string owned by the runtime, valid until the
+    // next runtime call on this thread; copied here before any other call.
+    unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Host-call sessions (`hwr_p3_*`): PENDING ↔ RESOLVE until DONE or ERROR.
 fn run_session(start: &Start, input: &mut impl Read, output: &mut impl Write) -> Result<(), Stop> {
     let input_ptr = if start.input.is_empty() {
@@ -108,7 +123,7 @@ fn run_session(start: &Start, input: &mut impl Read, output: &mut impl Write) ->
         )
     };
     if session.is_null() {
-        write_frame(output, FRAME_ERROR, b"the plugin could not be started")?;
+        write_frame(output, FRAME_ERROR, start_failure().as_bytes())?;
         return Ok(());
     }
 
@@ -179,7 +194,7 @@ fn run_stream(start: &Start, input: &mut impl Read, output: &mut impl Write) -> 
         )
     };
     if session.is_null() {
-        write_frame(output, FRAME_ERROR, b"the plugin could not be started")?;
+        write_frame(output, FRAME_ERROR, start_failure().as_bytes())?;
         return Ok(());
     }
 

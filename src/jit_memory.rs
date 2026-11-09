@@ -207,10 +207,13 @@ mod macos {
             };
             if ptr == libc::MAP_FAILED {
                 let err = std::io::Error::last_os_error();
+                // The prefix lets hwr_last_error pass this through to the app
+                // as "this build can't run Wasm plugins" (#30).
                 wasmtime::bail!(
-                    "MAP_JIT allocation of {len} bytes for Wasm code failed: {err} \
+                    "{}: MAP_JIT allocation of {len} bytes for Wasm code failed: {err} \
                      (under the hardened runtime this needs the \
-                     com.apple.security.cs.allow-jit entitlement)"
+                     com.apple.security.cs.allow-jit entitlement)",
+                    crate::last_error::ERR_JIT_UNAVAILABLE
                 );
             }
             let region = Region {

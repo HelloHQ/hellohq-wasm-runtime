@@ -11,21 +11,25 @@
 //! entitlement and prove the runtime's code memory is `MAP_JIT`.
 //!
 //! It runs, in order, each printing one `ok:` line:
-//! 1. `hwr_eval_add` — a core module compiled in-process (Cranelift).
-//! 2. `hwr_p3_start_plugin_compile` — the real hello-world SDK plugin, compiled
+//! 1. `hwr_p3_start_plugin_compile` — the real hello-world SDK plugin, compiled
 //!    in-process; the app's desktop Tier-2 entrypoint.
-//! 3. `hwr_precompile_component` + `hwr_p3_start_plugin` — the same plugin as a
+//! 2. `hwr_precompile_component` + `hwr_p3_start_plugin` — the same plugin as a
 //!    native precompiled artifact, deserialized (the load path, not compile).
+//! 3. `hwr_eval_add` — a core module compiled in-process (Cranelift).
+//!
+//! When a start returns null it prints the runtime's reason from
+//! `hwr_last_error` as `last-error: <line>` (#30); without allow-jit that line
+//! must start with `hellohq-runtime-jit-unavailable`.
 //!
 //! On success it prints `hardened-runtime-check: PASS` and exits 0. A runtime
 //! refusal (null handle / wrong result) exits 1. A kill by the kernel shows up
 //! to the caller as SIGKILL (exit status 137 in a shell).
 
 use hellohq_wasm_runtime::{
-    hwr_engine_free, hwr_engine_new, hwr_eval_add, hwr_free_bytes, hwr_p3_free, hwr_p3_poll,
-    hwr_p3_request_len, hwr_p3_request_ptr, hwr_p3_resolve, hwr_p3_result_len, hwr_p3_result_ptr,
-    hwr_p3_start_plugin, hwr_p3_start_plugin_compile, hwr_precompile_component, HwrP3Session,
-    HWR_P3_DONE, HWR_P3_ERROR, HWR_P3_PENDING,
+    hwr_engine_free, hwr_engine_new, hwr_eval_add, hwr_free_bytes, hwr_last_error, hwr_p3_free,
+    hwr_p3_poll, hwr_p3_request_len, hwr_p3_request_ptr, hwr_p3_resolve, hwr_p3_result_len,
+    hwr_p3_result_ptr, hwr_p3_start_plugin, hwr_p3_start_plugin_compile, hwr_precompile_component,
+    HwrP3Session, HWR_P3_DONE, HWR_P3_ERROR, HWR_P3_PENDING,
 };
 
 /// hello-world v1.0.1 from HelloHQ/plugin-sdk (sha256 pinned in the script).
@@ -69,6 +73,18 @@ fn map_jit_probe() -> String {
     }
 }
 
+/// The runtime's reason for the last null it returned on this thread (#30).
+fn last_error() -> String {
+    let p = hwr_last_error();
+    if p.is_null() {
+        return "(none)".to_string();
+    }
+    // SAFETY: NUL-terminated, runtime-owned, read before any other runtime call.
+    unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Answer the plugin's host calls the way the app does for a granted run.
 fn service(req: &[u8]) -> Vec<u8> {
     let v: serde_json::Value = serde_json::from_slice(req).unwrap_or_default();
@@ -84,6 +100,7 @@ fn service(req: &[u8]) -> Vec<u8> {
 /// Drive a P3 session to completion, servicing host calls; returns the output.
 unsafe fn drive(session: *mut HwrP3Session, what: &str) -> String {
     if session.is_null() {
+        println!("last-error: {}", last_error());
         fail(&format!(
             "{what}: the runtime refused to start the plugin (null session)"
         ));
@@ -119,15 +136,8 @@ unsafe fn drive(session: *mut HwrP3Session, what: &str) -> String {
 }
 
 fn main() {
-    // 1. Core module, Cranelift, compiled in-process.
-    let sum = hwr_eval_add(0, 2, 3);
-    if sum != 5 {
-        fail(&format!("hwr_eval_add(2, 3) returned {sum}"));
-    }
-    println!("ok: hwr_eval_add (Cranelift core module) = {sum}");
-
     unsafe {
-        // 2. The real plugin, compiled in-process (the app's desktop path).
+        // 1. The real plugin, compiled in-process (the app's desktop path).
         let out = drive(
             hwr_p3_start_plugin_compile(
                 0,
@@ -140,15 +150,17 @@ fn main() {
         );
         println!("ok: hwr_p3_start_plugin_compile (hello-world, Cranelift) -> {out}");
 
-        // 3. The same plugin as a precompiled native artifact, deserialized.
+        // 2. The same plugin as a precompiled native artifact, deserialized.
         let engine = hwr_engine_new(0);
         if engine.is_null() {
+            println!("last-error: {}", last_error());
             fail("hwr_engine_new(0) returned null");
         }
         let mut len = 0usize;
         let artifact =
             hwr_precompile_component(engine, PLUGIN_WASM.as_ptr(), PLUGIN_WASM.len(), &mut len);
         if artifact.is_null() {
+            println!("last-error: {}", last_error());
             fail("hwr_precompile_component returned null");
         }
         let out = drive(
@@ -159,6 +171,14 @@ fn main() {
         hwr_engine_free(engine);
         println!("ok: hwr_p3_start_plugin (hello-world, precompiled native artifact) -> {out}");
     }
+
+    // 3. Core module, Cranelift, compiled in-process. Last, because it reports
+    // failure only as a sentinel; the C ABI starts above say why.
+    let sum = hwr_eval_add(0, 2, 3);
+    if sum != 5 {
+        fail(&format!("hwr_eval_add(2, 3) returned {sum}"));
+    }
+    println!("ok: hwr_eval_add (Cranelift core module) = {sum}");
 
     // Prove the code above ran from MAP_JIT memory. On a host that enforces the
     // hardened runtime the fallback could not have run at all, but on one that

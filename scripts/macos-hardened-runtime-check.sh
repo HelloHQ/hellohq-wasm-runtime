@@ -9,8 +9,10 @@
 #
 #   control    not hardened                   -> must PASS (the binary works)
 #   allow-jit  hardened + allow-jit only      -> must PASS (code is in MAP_JIT memory)
-#   no-jit     hardened, no entitlements      -> must NOT pass (MAP_JIT is refused,
-#                                                or the kernel kills the process)
+#   no-jit     hardened, no entitlements      -> must NOT pass: MAP_JIT is refused
+#                                                and hwr_last_error says so with the
+#                                                hellohq-runtime-jit-unavailable prefix
+#                                                (#30), or the kernel kills the process
 #
 # Before the MAP_JIT fix the allow-jit case was killed with
 # `SIGKILL (Code Signature Invalid)`, exactly like the app (G0.4, 2026-10-17).
@@ -134,8 +136,13 @@ elif [[ $RC -eq 0 ]]; then
   failures=$((failures + 1))
 elif [[ $RC -eq 137 ]]; then
   echo "PASS  hardened, no entitlements: killed by the kernel (SIGKILL)"
+elif [[ "$OUT" == *"last-error: hellohq-runtime-jit-unavailable: "* ]]; then
+  # The refusal reached the caller through the C ABI with its reason (#30).
+  echo "PASS  hardened, no entitlements: runtime refused (exit $RC) and said why:"
+  echo "$OUT" | grep '^last-error: ' | sed 's/^/        /'
 else
-  echo "PASS  hardened, no entitlements: runtime refused (exit $RC): $(echo "$OUT" | tail -1)"
+  echo "FAIL  hardened, no entitlements: refused (exit $RC) but hwr_last_error did not report the missing JIT entitlement"
+  echo "$OUT"; failures=$((failures + 1))
 fi
 
 if [[ $failures -ne 0 ]]; then

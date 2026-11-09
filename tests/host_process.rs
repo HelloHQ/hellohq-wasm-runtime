@@ -222,8 +222,41 @@ fn a_broken_component_is_an_error_not_a_crash() {
     let mut h = Helper::spawn();
     h.start(SessionKind::PluginCompile, false, b"not a component", 0);
     let (ty, msg) = h.read().expect("ERROR");
-    assert_eq!(ty, FRAME_ERROR, "{}", String::from_utf8_lossy(&msg));
+    let msg = String::from_utf8_lossy(&msg).into_owned();
+    assert_eq!(ty, FRAME_ERROR, "{msg}");
+    // The runtime's reason, not a generic "could not be started" (#30).
+    assert!(msg.starts_with("hellohq-plugin-invalid: "), "{msg}");
     assert_eq!(h.exit_code(), Some(0));
+}
+
+#[test]
+fn a_precompiled_artifact_from_elsewhere_says_so() {
+    let mut h = Helper::spawn();
+    h.start(SessionKind::PluginPrecompiled, false, b"not an artifact", 0);
+    let (ty, msg) = h.read().expect("ERROR");
+    let msg = String::from_utf8_lossy(&msg).into_owned();
+    assert_eq!(ty, FRAME_ERROR, "{msg}");
+    assert!(
+        msg.starts_with("hellohq-plugin-artifact-incompatible: "),
+        "{msg}"
+    );
+    assert_eq!(h.exit_code(), Some(0));
+}
+
+#[test]
+fn a_broken_streaming_component_says_why() {
+    for kind in [SessionKind::Http, SessionKind::Inference] {
+        let mut h = Helper::spawn();
+        h.start(kind, false, b"not a component", 0);
+        let (ty, msg) = h.read().expect("ERROR");
+        let msg = String::from_utf8_lossy(&msg).into_owned();
+        assert_eq!(ty, FRAME_ERROR, "{msg}");
+        assert!(
+            msg.starts_with("hellohq-plugin-invalid: "),
+            "{kind:?}: {msg}"
+        );
+        assert_eq!(h.exit_code(), Some(0));
+    }
 }
 
 #[test]

@@ -119,6 +119,9 @@ pub mod request_policy;
 // messages. Plain Rust + Wasmtime only, so it is in every build.
 pub mod limits;
 
+// Why the last start/load call on this thread failed: hwr_last_error (#30).
+pub mod last_error;
+
 // Wire format for `hellohq-wasm-host`, the helper that runs one plugin session
 // out of the app's process over stdin/stdout. Pure framing, no Wasmtime, so it
 // is in every build (the app side reimplements it; the tests pin both).
@@ -461,6 +464,24 @@ pub extern "C" fn hwr_set_fuel_budget(fuel: u64) {
     limits::set_fuel_budget(fuel);
 }
 
+/// Why the last failed start or load call **on this thread** returned null
+/// (#30), as one NUL-terminated UTF-8 line, or null when that call succeeded.
+/// The line starts with a stable prefix the app matches on (see
+/// `src/last_error.rs`), e.g. `hellohq-runtime-jit-unavailable: ...` when
+/// macOS refused `MAP_JIT` (the build lacks the allow-jit entitlement). It
+/// never contains plugin-supplied text. Additive to the ABI.
+///
+/// Covers [hwr_engine_new], [hwr_instance_new], [hwr_precompile_component],
+/// [hwr_instance_new_precompiled] and every `hwr_p3_start*` / `hwr_p3s_start*`.
+///
+/// # Safety
+/// The pointer is owned by the runtime and valid until the next runtime call
+/// on this thread; copy it before making one.
+#[no_mangle]
+pub extern "C" fn hwr_last_error() -> *const std::ffi::c_char {
+    last_error::as_ptr()
+}
+
 /// Smoke test: constructs a default Wasmtime engine to prove the native runtime
 /// links and initialises on this platform/backend. Returns `1` on success, `0`
 /// on failure or panic. Used by the FFI harness and the Spike-1 iOS probe.
@@ -637,21 +658,16 @@ pub struct HwrEngine {
 #[no_mangle]
 pub extern "C" fn hwr_engine_new(use_pulley: i32) -> *mut HwrEngine {
     std::panic::catch_unwind(|| {
-        let mut cfg = wasmtime::Config::new();
-        crate::jit_memory::configure(&mut cfg);
+        last_error::clear();
         // The precompile/instance engines must match the run engines' config, or
         // an artifact compiled here fails to deserialize in a P3 run (#25). Fuel
-        // is such a setting: enable it on both sides.
-        limits::configure_engine(&mut cfg);
-        if use_pulley != 0 {
-            cfg.target("pulley64").ok()?;
+        // is such a setting: p3_engine enables it on both sides.
+        match p3_engine(use_pulley != 0) {
+            Ok(engine) => Box::into_raw(Box::new(HwrEngine { engine })),
+            Err(e) => last_error::fail_at(last_error::Stage::Engine, &e),
         }
-        let engine = wasmtime::Engine::new(&cfg).ok()?;
-        Some(Box::into_raw(Box::new(HwrEngine { engine })))
     })
-    .ok()
-    .flatten()
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| last_error::fail(last_error::internal()))
 }
 
 /// Releases an engine from [hwr_engine_new].
@@ -688,22 +704,37 @@ pub unsafe extern "C" fn hwr_instance_new(
     bytes: *const u8,
     len: usize,
 ) -> *mut HwrInstance {
+    last_error::clear();
     if engine.is_null() || bytes.is_null() {
-        return std::ptr::null_mut();
+        return last_error::fail(last_error::bad_argument());
     }
     let eng = &(*engine).engine;
     let wasm = std::slice::from_raw_parts(bytes, len);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let component = crate::jit_memory::compile_component(eng, wasm).ok()?;
-        let linker = wasmtime::component::Linker::new(eng);
-        let mut store = wasmtime::Store::new(eng, ());
-        store.set_fuel(crate::limits::fuel_budget()).ok()?;
-        let instance = linker.instantiate(&mut store, &component).ok()?;
-        Some(Box::into_raw(Box::new(HwrInstance { store, instance })))
+        let component = match crate::jit_memory::compile_component(eng, wasm) {
+            Ok(c) => c,
+            Err(e) => return last_error::fail_at(last_error::Stage::Compile, &e),
+        };
+        instantiate_handle(eng, &component)
     }))
-    .ok()
-    .flatten()
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| last_error::fail(last_error::internal()))
+}
+
+/// Instantiate `component` on a fresh store with the run's fuel budget, for the
+/// reusable [HwrInstance] handle. Null (with [hwr_last_error] set) on failure.
+fn instantiate_handle(
+    eng: &wasmtime::Engine,
+    component: &wasmtime::component::Component,
+) -> *mut HwrInstance {
+    let linker = wasmtime::component::Linker::new(eng);
+    let mut store = wasmtime::Store::new(eng, ());
+    if let Err(e) = store.set_fuel(crate::limits::fuel_budget()) {
+        return last_error::fail_at(last_error::Stage::Instantiate, &e);
+    }
+    match linker.instantiate(&mut store, component) {
+        Ok(instance) => Box::into_raw(Box::new(HwrInstance { store, instance })),
+        Err(e) => last_error::fail_at(last_error::Stage::Instantiate, &e),
+    }
 }
 
 /// Releases an instance handle.
@@ -764,23 +795,23 @@ pub unsafe extern "C" fn hwr_precompile_component(
     len: usize,
     out_len: *mut usize,
 ) -> *mut u8 {
+    last_error::clear();
     if engine.is_null() || bytes.is_null() || out_len.is_null() {
-        return std::ptr::null_mut();
+        return last_error::fail(last_error::bad_argument());
     }
     let eng = &(*engine).engine;
     let wasm = std::slice::from_raw_parts(bytes, len);
     let artifact = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        eng.precompile_component(wasm).ok()
-    }))
-    .ok()
-    .flatten();
+        eng.precompile_component(wasm)
+    }));
     match artifact {
-        Some(v) => {
+        Ok(Ok(v)) => {
             *out_len = v.len();
             // Hand ownership of the boxed slice to C; reclaimed by hwr_free_bytes.
             Box::into_raw(v.into_boxed_slice()) as *mut u8
         }
-        None => std::ptr::null_mut(),
+        Ok(Err(e)) => last_error::fail_at(last_error::Stage::Compile, &e),
+        Err(_) => last_error::fail(last_error::internal()),
     }
 }
 
@@ -810,22 +841,20 @@ pub unsafe extern "C" fn hwr_instance_new_precompiled(
     bytes: *const u8,
     len: usize,
 ) -> *mut HwrInstance {
+    last_error::clear();
     if engine.is_null() || bytes.is_null() {
-        return std::ptr::null_mut();
+        return last_error::fail(last_error::bad_argument());
     }
     let eng = &(*engine).engine;
     let artifact = std::slice::from_raw_parts(bytes, len);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let component = crate::jit_memory::deserialize_component(eng, artifact).ok()?;
-        let linker = wasmtime::component::Linker::new(eng);
-        let mut store = wasmtime::Store::new(eng, ());
-        store.set_fuel(crate::limits::fuel_budget()).ok()?;
-        let instance = linker.instantiate(&mut store, &component).ok()?;
-        Some(Box::into_raw(Box::new(HwrInstance { store, instance })))
+        let component = match crate::jit_memory::deserialize_component(eng, artifact) {
+            Ok(c) => c,
+            Err(e) => return last_error::fail_at(last_error::Stage::Deserialize, &e),
+        };
+        instantiate_handle(eng, &component)
     }))
-    .ok()
-    .flatten()
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| last_error::fail(last_error::internal()))
 }
 
 // ── P3: Dart-serviced host-call round-trip (step/poll bridge) ────────────────
@@ -1046,8 +1075,9 @@ pub unsafe extern "C" fn hwr_p3_start(
     input_len: usize,
 ) -> *mut HwrP3Session {
     std::panic::catch_unwind(|| {
+        crate::last_error::clear();
         if component.is_null() {
-            return std::ptr::null_mut();
+            return crate::last_error::fail(crate::last_error::bad_argument());
         }
         let comp_bytes = std::slice::from_raw_parts(component, component_len);
         let input_bytes = if input.is_null() {
@@ -1057,17 +1087,17 @@ pub unsafe extern "C" fn hwr_p3_start(
         };
         let engine = match p3_engine(use_pulley != 0) {
             Ok(e) => e,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Engine, &e),
         };
         // SAFETY: caller guarantees the bytes came from this runtime's
         // precompile/serialize (the trust boundary is the SHA-pinned fetch).
         let component = match crate::jit_memory::deserialize_component(&engine, comp_bytes) {
             Ok(c) => c,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Deserialize, &e),
         };
         Box::into_raw(Box::new(p3_run_session(engine, component, input_bytes)))
     })
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| crate::last_error::fail(crate::last_error::internal()))
 }
 
 /// As [hwr_p3_start] but **compiles** a raw component (Cranelift) instead of
@@ -1086,8 +1116,9 @@ pub unsafe extern "C" fn hwr_p3_start_compile(
     input_len: usize,
 ) -> *mut HwrP3Session {
     std::panic::catch_unwind(|| {
+        crate::last_error::clear();
         if component.is_null() {
-            return std::ptr::null_mut();
+            return crate::last_error::fail(crate::last_error::bad_argument());
         }
         let comp_bytes = std::slice::from_raw_parts(component, component_len);
         let input_bytes = if input.is_null() {
@@ -1097,15 +1128,15 @@ pub unsafe extern "C" fn hwr_p3_start_compile(
         };
         let engine = match p3_engine(use_pulley != 0) {
             Ok(e) => e,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Engine, &e),
         };
         let component = match crate::jit_memory::compile_component(&engine, comp_bytes) {
             Ok(c) => c,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Compile, &e),
         };
         Box::into_raw(Box::new(p3_run_session(engine, component, input_bytes)))
     })
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| crate::last_error::fail(crate::last_error::internal()))
 }
 
 // ── C1: typed-import P3 sessions ─────────────────────────────────────────────
@@ -1163,23 +1194,24 @@ pub unsafe extern "C" fn hwr_p3_start_workspace_compile(
     component_len: usize,
 ) -> *mut HwrP3Session {
     std::panic::catch_unwind(|| {
+        crate::last_error::clear();
         if component.is_null() {
-            return std::ptr::null_mut();
+            return crate::last_error::fail(crate::last_error::bad_argument());
         }
         let comp_bytes = std::slice::from_raw_parts(component, component_len);
         let engine = match p3_engine(use_pulley != 0) {
             Ok(e) => e,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Engine, &e),
         };
         let component = match crate::jit_memory::compile_component(&engine, comp_bytes) {
             Ok(c) => c,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Compile, &e),
         };
         Box::into_raw(Box::new(p3_run_session_sync(move |tx| {
             crate::plugin_host::drive_workspace_run(engine, component, tx)
         })))
     })
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| crate::last_error::fail(crate::last_error::internal()))
 }
 
 /// As [hwr_p3_start_workspace_compile] but **deserializes** a precompiled
@@ -1197,25 +1229,26 @@ pub unsafe extern "C" fn hwr_p3_start_workspace(
     component_len: usize,
 ) -> *mut HwrP3Session {
     std::panic::catch_unwind(|| {
+        crate::last_error::clear();
         if component.is_null() {
-            return std::ptr::null_mut();
+            return crate::last_error::fail(crate::last_error::bad_argument());
         }
         let comp_bytes = std::slice::from_raw_parts(component, component_len);
         let engine = match p3_engine(use_pulley != 0) {
             Ok(e) => e,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Engine, &e),
         };
         // SAFETY: caller guarantees the bytes came from this runtime's
         // precompile/serialize (the trust boundary is the SHA-pinned fetch).
         let component = match crate::jit_memory::deserialize_component(&engine, comp_bytes) {
             Ok(c) => c,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Deserialize, &e),
         };
         Box::into_raw(Box::new(p3_run_session_sync(move |tx| {
             crate::plugin_host::drive_workspace_run(engine, component, tx)
         })))
     })
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| crate::last_error::fail(crate::last_error::internal()))
 }
 
 /// Start a TYPED `storage`+`events` P3 run (compile variant): a component that
@@ -1233,23 +1266,24 @@ pub unsafe extern "C" fn hwr_p3_start_storage_events_compile(
     component_len: usize,
 ) -> *mut HwrP3Session {
     std::panic::catch_unwind(|| {
+        crate::last_error::clear();
         if component.is_null() {
-            return std::ptr::null_mut();
+            return crate::last_error::fail(crate::last_error::bad_argument());
         }
         let comp_bytes = std::slice::from_raw_parts(component, component_len);
         let engine = match p3_engine(use_pulley != 0) {
             Ok(e) => e,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Engine, &e),
         };
         let component = match crate::jit_memory::compile_component(&engine, comp_bytes) {
             Ok(c) => c,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Compile, &e),
         };
         Box::into_raw(Box::new(p3_run_session_sync(move |tx| {
             crate::plugin_host_storage_events::drive_storage_events_run(engine, component, tx)
         })))
     })
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| crate::last_error::fail(crate::last_error::internal()))
 }
 
 /// As [hwr_p3_start_storage_events_compile] but **deserializes** a precompiled
@@ -1266,25 +1300,26 @@ pub unsafe extern "C" fn hwr_p3_start_storage_events(
     component_len: usize,
 ) -> *mut HwrP3Session {
     std::panic::catch_unwind(|| {
+        crate::last_error::clear();
         if component.is_null() {
-            return std::ptr::null_mut();
+            return crate::last_error::fail(crate::last_error::bad_argument());
         }
         let comp_bytes = std::slice::from_raw_parts(component, component_len);
         let engine = match p3_engine(use_pulley != 0) {
             Ok(e) => e,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Engine, &e),
         };
         // SAFETY: caller guarantees the bytes came from this runtime's
         // precompile/serialize (the trust boundary is the SHA-pinned fetch).
         let component = match crate::jit_memory::deserialize_component(&engine, comp_bytes) {
             Ok(c) => c,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Deserialize, &e),
         };
         Box::into_raw(Box::new(p3_run_session_sync(move |tx| {
             crate::plugin_host_storage_events::drive_storage_events_run(engine, component, tx)
         })))
     })
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| crate::last_error::fail(crate::last_error::internal()))
 }
 
 /// C1 keystone (compile variant). Start a UNIFIED typed-plugin P3 run: a real
@@ -1306,8 +1341,9 @@ pub unsafe extern "C" fn hwr_p3_start_plugin_compile(
     input_len: usize,
 ) -> *mut HwrP3Session {
     std::panic::catch_unwind(|| {
+        crate::last_error::clear();
         if component.is_null() {
-            return std::ptr::null_mut();
+            return crate::last_error::fail(crate::last_error::bad_argument());
         }
         let comp_bytes = std::slice::from_raw_parts(component, component_len);
         let input_bytes = if input.is_null() {
@@ -1317,17 +1353,17 @@ pub unsafe extern "C" fn hwr_p3_start_plugin_compile(
         };
         let engine = match p3_engine(use_pulley != 0) {
             Ok(e) => e,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Engine, &e),
         };
         let component = match crate::jit_memory::compile_component(&engine, comp_bytes) {
             Ok(c) => c,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Compile, &e),
         };
         Box::into_raw(Box::new(p3_run_session_sync(move |tx| {
             crate::plugin_host_full::drive_plugin_run(engine, component, input_bytes, tx)
         })))
     })
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| crate::last_error::fail(crate::last_error::internal()))
 }
 
 /// As [hwr_p3_start_plugin_compile] but **deserializes** a precompiled component
@@ -1346,8 +1382,9 @@ pub unsafe extern "C" fn hwr_p3_start_plugin(
     input_len: usize,
 ) -> *mut HwrP3Session {
     std::panic::catch_unwind(|| {
+        crate::last_error::clear();
         if component.is_null() {
-            return std::ptr::null_mut();
+            return crate::last_error::fail(crate::last_error::bad_argument());
         }
         let comp_bytes = std::slice::from_raw_parts(component, component_len);
         let input_bytes = if input.is_null() {
@@ -1357,19 +1394,19 @@ pub unsafe extern "C" fn hwr_p3_start_plugin(
         };
         let engine = match p3_engine(use_pulley != 0) {
             Ok(e) => e,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Engine, &e),
         };
         // SAFETY: caller guarantees the bytes came from this runtime's
         // precompile/serialize (the trust boundary is the SHA-pinned fetch).
         let component = match crate::jit_memory::deserialize_component(&engine, comp_bytes) {
             Ok(c) => c,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Deserialize, &e),
         };
         Box::into_raw(Box::new(p3_run_session_sync(move |tx| {
             crate::plugin_host_full::drive_plugin_run(engine, component, input_bytes, tx)
         })))
     })
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| crate::last_error::fail(crate::last_error::internal()))
 }
 
 /// Block until the run yields a pending host call or finishes. Returns
@@ -1723,17 +1760,17 @@ pub unsafe extern "C" fn hwr_p3s_result_len(session: *mut HwrP3Stream) -> usize 
 /// model + async + concurrency, to mint streams/futures), optionally targeting
 /// the Pulley interpreter. Returns None on misconfiguration.
 #[cfg(feature = "wasi-http")]
-fn p3s_engine(use_pulley: bool) -> Option<wasmtime::Engine> {
+fn p3s_engine(use_pulley: bool) -> wasmtime::Result<wasmtime::Engine> {
     let mut cfg = wasmtime::Config::new();
     crate::jit_memory::configure(&mut cfg);
     limits::configure_engine(&mut cfg);
     cfg.wasm_component_model(true);
     cfg.wasm_component_model_async(true);
     cfg.concurrency_support(true);
-    if use_pulley && cfg.target("pulley64").is_err() {
-        return None;
+    if use_pulley {
+        cfg.target("pulley64")?;
     }
-    wasmtime::Engine::new(&cfg).ok()
+    wasmtime::Engine::new(&cfg)
 }
 
 /// Run the `wasi:http` guest [component] on [engine] over the P3 v2 transport.
@@ -1814,21 +1851,22 @@ pub unsafe extern "C" fn hwr_p3s_start_http(
     component_len: usize,
 ) -> *mut HwrP3Stream {
     std::panic::catch_unwind(|| {
+        crate::last_error::clear();
         if component.is_null() {
-            return std::ptr::null_mut();
+            return crate::last_error::fail(crate::last_error::bad_argument());
         }
         let comp_bytes = std::slice::from_raw_parts(component, component_len).to_vec();
         let engine = match p3s_engine(use_pulley != 0) {
-            Some(e) => e,
-            None => return std::ptr::null_mut(),
+            Ok(e) => e,
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Engine, &e),
         };
         let component = match crate::jit_memory::compile_component(&engine, &comp_bytes) {
             Ok(c) => c,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Compile, &e),
         };
         p3s_http_session(engine, component)
     })
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| crate::last_error::fail(crate::last_error::internal()))
 }
 
 /// No-JIT twin of [hwr_p3s_start_http]: DESERIALIZE a precompiled (pulley64)
@@ -1848,22 +1886,24 @@ pub unsafe extern "C" fn hwr_p3s_start_http_precompiled(
     component_len: usize,
 ) -> *mut HwrP3Stream {
     std::panic::catch_unwind(|| {
+        crate::last_error::clear();
         if component.is_null() {
-            return std::ptr::null_mut();
+            return crate::last_error::fail(crate::last_error::bad_argument());
         }
         let comp_bytes = std::slice::from_raw_parts(component, component_len).to_vec();
         let engine = match p3s_engine(use_pulley != 0) {
-            Some(e) => e,
-            None => return std::ptr::null_mut(),
+            Ok(e) => e,
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Engine, &e),
         };
-        let component =
-            match unsafe { crate::jit_memory::deserialize_component(&engine, &comp_bytes) } {
-                Ok(c) => c,
-                Err(_) => return std::ptr::null_mut(),
-            };
+        let component = match unsafe {
+            crate::jit_memory::deserialize_component(&engine, &comp_bytes)
+        } {
+            Ok(c) => c,
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Deserialize, &e),
+        };
         p3s_http_session(engine, component)
     })
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| crate::last_error::fail(crate::last_error::internal()))
 }
 
 /// Start a streaming `hellohq:plugin/inference` session by COMPILING `component`
@@ -1885,21 +1925,22 @@ pub unsafe extern "C" fn hwr_p3s_start_inference(
     component_len: usize,
 ) -> *mut HwrP3Stream {
     std::panic::catch_unwind(|| {
+        crate::last_error::clear();
         if component.is_null() {
-            return std::ptr::null_mut();
+            return crate::last_error::fail(crate::last_error::bad_argument());
         }
         let comp_bytes = std::slice::from_raw_parts(component, component_len).to_vec();
         let engine = match p3s_engine(use_pulley != 0) {
-            Some(e) => e,
-            None => return std::ptr::null_mut(),
+            Ok(e) => e,
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Engine, &e),
         };
         let component = match crate::jit_memory::compile_component(&engine, &comp_bytes) {
             Ok(c) => c,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Compile, &e),
         };
         p3s_inference_session(engine, component)
     })
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| crate::last_error::fail(crate::last_error::internal()))
 }
 
 /// No-JIT twin of [hwr_p3s_start_inference]: DESERIALIZE a precompiled (pulley64)
@@ -1918,22 +1959,24 @@ pub unsafe extern "C" fn hwr_p3s_start_inference_precompiled(
     component_len: usize,
 ) -> *mut HwrP3Stream {
     std::panic::catch_unwind(|| {
+        crate::last_error::clear();
         if component.is_null() {
-            return std::ptr::null_mut();
+            return crate::last_error::fail(crate::last_error::bad_argument());
         }
         let comp_bytes = std::slice::from_raw_parts(component, component_len).to_vec();
         let engine = match p3s_engine(use_pulley != 0) {
-            Some(e) => e,
-            None => return std::ptr::null_mut(),
+            Ok(e) => e,
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Engine, &e),
         };
-        let component =
-            match unsafe { crate::jit_memory::deserialize_component(&engine, &comp_bytes) } {
-                Ok(c) => c,
-                Err(_) => return std::ptr::null_mut(),
-            };
+        let component = match unsafe {
+            crate::jit_memory::deserialize_component(&engine, &comp_bytes)
+        } {
+            Ok(c) => c,
+            Err(e) => return crate::last_error::fail_at(crate::last_error::Stage::Deserialize, &e),
+        };
         p3s_inference_session(engine, component)
     })
-    .unwrap_or(std::ptr::null_mut())
+    .unwrap_or_else(|_| crate::last_error::fail(crate::last_error::internal()))
 }
 
 /// Free a streaming session, closing inbound and joining the worker.

@@ -77,6 +77,17 @@ prefixed with `hellohq-plugin-cpu-limit:` or `hellohq-plugin-memory-limit:`.
 and the P3 run engines share the setting, so artifacts produced by this crate
 round-trip; artifacts precompiled by an older release must be regenerated.
 
+## Start failures
+
+A start or load call that returns null records why (`hellohq-wasm-runtime#30`,
+`src/last_error.rs`). Read it with `hwr_last_error()` on the same thread, before
+the next runtime call: one line with a stable prefix the app can match, and no
+plugin-supplied text. The prefixes are listed in
+`include/hellohq_wasm_runtime.h`. The one to know:
+`hellohq-runtime-jit-unavailable:` means macOS refused `MAP_JIT` memory, i.e.
+the process lacks `com.apple.security.cs.allow-jit`.
+`scripts/macos-hardened-runtime-check.sh` checks that case on a real Mac.
+
 ## Out-of-process helper
 
 `hellohq-wasm-host` (`src/bin/hellohq-wasm-host.rs`) runs **one** plugin
@@ -98,6 +109,9 @@ Why an app would use it:
   to start under App Sandbox; `build.rs` embeds
   `src/bin/hellohq-wasm-host.Info.plist`. It must be signed with a team identity
   (an ad-hoc signature traps at launch under App Sandbox).
+
+When a session cannot start, the helper's ERROR frame carries that same
+`hwr_last_error()` line.
 
 The helper exits after DONE or ERROR, exits with code 2 when its stdin closes
 (the app went away), and never outlives the app. `tests/host_process.rs` drives

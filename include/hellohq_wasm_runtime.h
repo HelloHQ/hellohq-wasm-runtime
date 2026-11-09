@@ -52,6 +52,23 @@ int32_t  hwr_self_test(void);            /* [no-JIT] 1 = runtime links + inits  
  * artifacts when adopting this version. */
 void     hwr_set_fuel_budget(uint64_t fuel);  /* [no-JIT] 0 = default (1e9) */
 
+/* ── Why a start/load call failed (#30) ─────────────────────────────────── */
+/* After hwr_engine_new, hwr_instance_new(_precompiled), hwr_precompile_component
+ * or any hwr_p3_start* / hwr_p3s_start* returns NULL, this is one NUL-terminated
+ * UTF-8 line saying why; NULL when that call succeeded. Thread-local (like
+ * errno): read it on the same thread, before the next runtime call, which may
+ * free it. It starts with a stable prefix and never quotes the plugin:
+ *   hellohq-runtime-jit-unavailable       MAP_JIT refused (macOS build without
+ *                                         the allow-jit entitlement)
+ *   hellohq-runtime-engine                engine could not be created
+ *   hellohq-plugin-invalid                not a component this runtime can compile
+ *   hellohq-plugin-artifact-incompatible  precompiled by another version/backend
+ *   hellohq-plugin-instantiate            could not be instantiated
+ *   hellohq-runtime-bad-argument          NULL component bytes
+ *   hellohq-runtime-internal              the runtime panicked
+ * Additive: HWR_ABI_VERSION is unchanged. */
+const char* hwr_last_error(void);             /* [no-JIT] */
+
 /* ── Engine + instance lifecycle (the iOS execution path) ────────────────── */
 HwrEngine*   hwr_engine_new(int32_t use_pulley);                 /* [no-JIT] */
 void         hwr_engine_free(HwrEngine* engine);                 /* [no-JIT] */
