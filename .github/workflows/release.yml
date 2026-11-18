@@ -76,10 +76,19 @@ jobs:
             Write-Host 'S4: no DOPPLER_TOKEN_RELEASE (fork or PR); library stays unsigned.'
             exit 0
           }
+          # Doppler's REST API rather than the CLI: these repos do not install
+          # the CLI, and a signing step must not depend on it being present.
           foreach ($n in $names) {
-            $v = & doppler secrets get $n --plain --project hellohq-release --config stg --token $env:DOPPLER_TOKEN_RELEASE 2>$null
-            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrEmpty($v)) {
-              throw "S4: $n is missing from hellohq-release/stg; cannot sign the release library"
+            $uri = "https://api.doppler.com/v3/configs/config/secret?project=hellohq-release&config=stg&name=$n"
+            try {
+              $r = Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $env:DOPPLER_TOKEN_RELEASE" } -ErrorAction Stop
+            } catch {
+              throw "S4: cannot read $n from hellohq-release/stg; cannot sign the release library. $_"
+            }
+            $v = $r.value.raw
+            if ([string]::IsNullOrEmpty($v)) { $v = $r.value.computed }
+            if ([string]::IsNullOrEmpty($v)) {
+              throw "S4: $n is empty in hellohq-release/stg; cannot sign the release library"
             }
             [Environment]::SetEnvironmentVariable($n, [string]$v, 'Process')
           }
