@@ -60,6 +60,32 @@ jobs:
         shell: bash
         run: bash scripts/build-release.sh "${{ runner.temp }}/dist"
 
+      # S4: sign the shipped library here, where it is built, with the
+      # credentials from the hellohq-release Doppler project. Consuming apps
+      # verify signatures instead of holding release secrets.
+      - name: Authenticode-sign the published library
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          DOPPLER_TOKEN_RELEASE: ${{ secrets.DOPPLER_TOKEN_RELEASE }}
+        run: |
+          $names = @('AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET',
+                     'TRUSTED_SIGNING_ENDPOINT', 'TRUSTED_SIGNING_ACCOUNT',
+                     'TRUSTED_SIGNING_CERT_PROFILE')
+          if (-not $env:DOPPLER_TOKEN_RELEASE) {
+            Write-Host 'S4: no DOPPLER_TOKEN_RELEASE (fork or PR); library stays unsigned.'
+            exit 0
+          }
+          foreach ($n in $names) {
+            $v = & doppler secrets get $n --plain --project hellohq-release --config stg --token $env:DOPPLER_TOKEN_RELEASE 2>$null
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrEmpty($v)) {
+              throw "S4: $n is missing from hellohq-release/stg; cannot sign the release library"
+            }
+            [Environment]::SetEnvironmentVariable($n, [string]$v, 'Process')
+          }
+          pwsh scripts/sign-windows-authenticode.ps1 -Path (Join-Path $env:RUNNER_TEMP 'dist')
+          pwsh scripts/sign-windows-authenticode.ps1 -VerifyOnly -Path (Join-Path $env:RUNNER_TEMP 'dist')
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.os }}
